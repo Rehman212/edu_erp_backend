@@ -17,6 +17,8 @@ import { PayrollController } from './payroll.controller';
 import { PayrollService } from './payroll.service';
 import { RegistrationController } from './registration.controller';
 import { RegistrationService } from './registration.service';
+import { CampusSetupController } from './campus-setup.controller';
+import { CampusSetupService } from './campus-setup.service';
 
 @Module({
   imports: [],
@@ -29,6 +31,7 @@ import { RegistrationService } from './registration.service';
     FinancialControlController,
     PayrollController,
     RegistrationController,
+    CampusSetupController,
     ActivityLogController,
   ],
   providers: [
@@ -41,6 +44,7 @@ import { RegistrationService } from './registration.service';
     FinancialControlService,
     PayrollService,
     RegistrationService,
+    CampusSetupService,
   ],
 })
 export class AppModule {}
