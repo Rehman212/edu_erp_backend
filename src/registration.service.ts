@@ -103,6 +103,12 @@ export class RegistrationService {
     if (scope) {
       params.push(`${scope}%`);
       where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
+      // Zone roots SRA/MTZ/TSC (1401/1402/1403): also match sdno prefix so a
+      // 1403-* student sitting on a 1401 campus does not show under SRA.
+      if (/^14(01|02|03)$/.test(scope)) {
+        params.push(`${scope}%`);
+        where.push(`trim(st.sdno) LIKE $${params.length}`);
+      }
     }
     if (classCode.trim()) {
       params.push(`${classCode.trim()}%`);
