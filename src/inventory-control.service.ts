@@ -1148,6 +1148,478 @@ export class InventoryControlService {
     };
   }
 
+  /** H.F Student Voucher (…G) / H.C Collection (…F) from accmast. */
+  private async listFeeVouchers(
+    username: string,
+    kind: 'studentVoucher' | 'collectionVoucher',
+    page = 1,
+    pageSize = 50,
+    site = '',
+  ) {
+    const scope = await this.siteScope(username, site);
+    if (String(site || '').trim() && !scope) {
+      return { rows: [], total: 0, page, pageSize };
+    }
+    const scopeCode = (scope || '').replace(/%/g, '');
+    const letter = kind === 'collectionVoucher' ? 'F' : 'G';
+    const offset = (page - 1) * pageSize;
+
+    const total = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+       FROM accmast m
+       WHERE right(upper(trim(m.invno)), 1) = $2
+         AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')`,
+      [scopeCode, letter],
+    );
+
+    const rows = await this.database.query<{
+      id: string;
+      invno: string;
+      invdate: string | null;
+      ccode: string;
+      siteName: string;
+      narp: string;
+      sdno: string;
+      studentName: string;
+      mont: string;
+      bcode: string;
+      aclas: string;
+      edate: string | null;
+      pcode: string;
+      dparty: string;
+      pinv: string;
+      gno: string;
+      pday: string;
+      frt: string;
+      discount: string;
+      pflag: string;
+      suffix: string;
+      atag: string;
+    }>(
+      `SELECT m.row_id::text AS id,
+              trim(m.invno) AS invno,
+              nullif(trim(m.invdate), '') AS invdate,
+              coalesce(trim(m.ccode), '') AS ccode,
+              coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '') AS "siteName",
+              coalesce(trim(m.nar), '') AS narp,
+              coalesce(trim(m.sdno), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), trim(m.sdno), '') AS "studentName",
+              coalesce(trim(m.mont), '') AS mont,
+              coalesce(trim(m.bcode), '') AS bcode,
+              coalesce(trim(m.aclas), '') AS aclas,
+              nullif(trim(m.edate), '') AS edate,
+              coalesce(trim(m.bcode), '') AS pcode,
+              coalesce(trim(m.sdno), '') AS dparty,
+              coalesce(trim(m.mont), '') AS pinv,
+              coalesce(trim(m.aclas), '') AS gno,
+              coalesce(trim(m.pday), '') AS pday,
+              '' AS frt,
+              '' AS discount,
+              coalesce(trim(m.pflag), '') AS pflag,
+              right(upper(trim(m.invno)), 1) AS suffix,
+              $3 AS atag
+       FROM accmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+       LEFT JOIN student st ON trim(st.sdno) = trim(m.sdno)
+       WHERE right(upper(trim(m.invno)), 1) = $2
+         AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+       ORDER BY m.row_id DESC
+       LIMIT $4 OFFSET $5`,
+      [scopeCode, letter, kind, pageSize, offset],
+    );
+
+    return {
+      rows: rows.rows,
+      total: Number(total.rows[0]?.n || 0),
+      page,
+      pageSize,
+    };
+  }
+
+  /**
+   * Inventory Voucher list from purmast (header only).
+   * kind splits mixed types: P purchase / student / collection via atag.
+   */
+  async listVouchers(
+    username: string,
+    suffixRaw = '',
+    page = 1,
+    pageSize = 50,
+    kindRaw = '',
+    siteRaw = '',
+  ) {
+    const current = Math.max(1, Number(page) || 1);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const offset = (current - 1) * size;
+    const kind = String(kindRaw || '').trim();
+    if (kind === 'studentVoucher' || kind === 'collectionVoucher') {
+      return this.listFeeVouchers(username, kind, current, size, siteRaw);
+    }
+    const scope = await this.siteScope(username, siteRaw);
+    if (String(siteRaw || '').trim() && !scope) {
+      return { rows: [], total: 0, page: current, pageSize: size };
+    }
+    const suffix = String(suffixRaw || '')
+      .trim()
+      .toUpperCase()
+      .slice(-1);
+    const letter = /[PRSN]/.test(suffix) ? suffix : '';
+
+    const scopeCode = (scope || '').replace(/%/g, '');
+    const typeWhere = `
+      AND (
+        ($3 = '' AND ($2 = '' OR right(upper(trim(m.invno)), 1) = $2))
+        OR ($3 = 'purchaseAssets'
+            AND right(upper(trim(m.invno)), 1) = 'P'
+            AND coalesce(trim(m.atag), '') IN ('', 'purchaseAssets'))
+        OR ($3 = 'purchaseReturn' AND right(upper(trim(m.invno)), 1) = 'R')
+        OR ($3 = 'saleGoods' AND right(upper(trim(m.invno)), 1) = 'S')
+        OR ($3 = 'saleReturn' AND right(upper(trim(m.invno)), 1) = 'N')
+        OR ($3 = 'studentVoucher' AND coalesce(trim(m.atag), '') = 'studentVoucher')
+        OR ($3 = 'collectionVoucher' AND coalesce(trim(m.atag), '') = 'collectionVoucher')
+      )`;
+
+    const total = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+       FROM purmast m
+       WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+         ${typeWhere}`,
+      [scopeCode, letter, kind],
+    );
+
+    const rows = await this.database.query<{
+      id: string;
+      invno: string;
+      invdate: string | null;
+      ccode: string;
+      siteName: string;
+      pcode: string;
+      dparty: string;
+      pinv: string;
+      gno: string;
+      pday: string;
+      narp: string;
+      frt: string;
+      discount: string;
+      pflag: string;
+      suffix: string;
+      atag: string;
+    }>(
+      `SELECT m.row_id::text AS id,
+              trim(m.invno) AS invno,
+              nullif(trim(m.invdate), '') AS invdate,
+              coalesce(trim(m.ccode), '') AS ccode,
+              coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '') AS "siteName",
+              coalesce(trim(m.pcode), '') AS pcode,
+              coalesce(trim(m.dparty), '') AS dparty,
+              coalesce(trim(m.pinv), '') AS pinv,
+              coalesce(trim(m.gno), '') AS gno,
+              coalesce(trim(m.pday), '') AS pday,
+              coalesce(trim(m.narp), '') AS narp,
+              coalesce(trim(m.frt), '') AS frt,
+              coalesce(trim(m.discount), '') AS discount,
+              coalesce(trim(m.pflag), '') AS pflag,
+              right(upper(trim(m.invno)), 1) AS suffix,
+              coalesce(trim(m.atag), '') AS atag
+       FROM purmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+       WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+         ${typeWhere}
+       ORDER BY m.row_id DESC
+       LIMIT $4 OFFSET $5`,
+      [scopeCode, letter, kind, size, offset],
+    );
+
+    return {
+      rows: rows.rows,
+      total: Number(total.rows[0]?.n || 0),
+      page: current,
+      pageSize: size,
+    };
+  }
+
+  /** Save Inventory Voucher header into purmast. */
+  async saveVoucher(
+    username: string,
+    body: {
+      invno?: string;
+      invdate?: string;
+      ccode?: string;
+      pcode?: string;
+      dparty?: string;
+      pinv?: string;
+      gno?: string;
+      pday?: string;
+      narp?: string;
+      frt?: string;
+      discount?: string;
+      pflag?: string;
+      suffix?: string;
+      kind?: string;
+      sdno?: string;
+      mont?: string;
+      bcode?: string;
+      aclas?: string;
+      edate?: string;
+    },
+  ) {
+    const kind = String(body.kind ?? '').trim();
+    if (kind === 'studentVoucher' || kind === 'collectionVoucher') {
+      return this.saveFeeVoucher(username, kind, body);
+    }
+
+    const ccode = String(body.ccode ?? '').trim();
+    if (!ccode) {
+      return { ok: false, message: 'Department is required.' };
+    }
+
+    const scope = await this.siteScope(username, ccode);
+    if (!scope) {
+      return { ok: false, message: 'Campus / department not allowed for this user.' };
+    }
+
+    let invno = String(body.invno ?? '').trim();
+    if (!invno) {
+      const suffix = String(body.suffix ?? 'P').trim().toUpperCase().slice(-1) || 'P';
+      const next = await this.nextInvoice(suffix);
+      invno = next.invno;
+    }
+
+    const exists = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM purmast WHERE trim(invno) = $1`,
+      [invno],
+    );
+    if (Number(exists.rows[0]?.n || 0) > 0) {
+      return { ok: false, message: `Invoice ${invno} already exists.`, invno };
+    }
+
+    const rawDate = String(body.invdate ?? '').trim();
+    const invdate = /^\d{4}-\d{2}-\d{2}/.test(rawDate)
+      ? `${rawDate.slice(0, 10)} 00:00:00`
+      : `${new Date().toISOString().slice(0, 10)} 00:00:00`;
+
+    const atag = [
+      'purchaseAssets',
+      'purchaseReturn',
+      'saleGoods',
+      'saleReturn',
+      'studentVoucher',
+      'collectionVoucher',
+    ].includes(kind)
+      ? kind
+      : '';
+
+    await this.database.query(
+      `INSERT INTO purmast
+         (invno, pcode, invdate, frt, discount, dparty, narp, pinv, gno, ccode, pflag, pday, atag)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        invno,
+        String(body.pcode ?? '').trim() || null,
+        invdate,
+        String(body.frt ?? '').trim() || null,
+        String(body.discount ?? '').trim() || null,
+        String(body.dparty ?? '').trim() || null,
+        String(body.narp ?? '').trim() || null,
+        String(body.pinv ?? '').trim() || null,
+        String(body.gno ?? '').trim() || null,
+        ccode,
+        String(body.pflag ?? '1').trim() || '1',
+        String(body.pday ?? '0').trim() || '0',
+        atag || null,
+      ],
+    );
+
+    const siteName = await this.siteName(ccode);
+    await this.activityLog.write({
+      category: 'activity',
+      username,
+      activity: 'Inventory Voucher Saved',
+      description: `Saved inventory voucher ${invno}`,
+      module: 'Inventory Voucher',
+      campus: siteName,
+      campusCode: ccode,
+      status: 'Success',
+      meta: { invno },
+    });
+
+    return {
+      ok: true,
+      message: `Voucher ${invno} saved.`,
+      invno,
+      siteName,
+    };
+  }
+
+  private async saveFeeVoucher(
+    username: string,
+    kind: 'studentVoucher' | 'collectionVoucher',
+    body: {
+      invno?: string;
+      invdate?: string;
+      ccode?: string;
+      narp?: string;
+      sdno?: string;
+      mont?: string;
+      bcode?: string;
+      aclas?: string;
+      edate?: string;
+      suffix?: string;
+    },
+  ) {
+    const ccode = String(body.ccode ?? '').trim();
+    if (!ccode) {
+      return { ok: false, message: 'Department is required.' };
+    }
+    const scope = await this.siteScope(username, ccode);
+    if (!scope) {
+      return { ok: false, message: 'Campus / department not allowed for this user.' };
+    }
+
+    const letter = kind === 'collectionVoucher' ? 'F' : 'G';
+    let invno = String(body.invno ?? '').trim();
+    if (!invno) {
+      const next = await this.nextInvoice(letter);
+      invno = next.invno;
+    }
+
+    const exists = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM accmast WHERE trim(invno) = $1`,
+      [invno],
+    );
+    if (Number(exists.rows[0]?.n || 0) > 0) {
+      return { ok: false, message: `Invoice ${invno} already exists.`, invno };
+    }
+
+    const rawDate = String(body.invdate ?? '').trim();
+    const invdate = /^\d{4}-\d{2}-\d{2}/.test(rawDate)
+      ? `${rawDate.slice(0, 10)} 00:00:00`
+      : `${new Date().toISOString().slice(0, 10)} 00:00:00`;
+    const edateRaw = String(body.edate ?? '').trim();
+    const edate = /^\d{4}-\d{2}-\d{2}/.test(edateRaw)
+      ? `${edateRaw.slice(0, 10)} 00:00:00`
+      : null;
+
+    await this.database.query(
+      `INSERT INTO accmast
+         (invno, invdate, nar, ccode, pflag, edate, tflag, sdno, mont, bcode, aclas)
+       VALUES ($1,$2,$3,$4,'P',$5,'1',$6,$7,$8,$9)`,
+      [
+        invno,
+        invdate,
+        String(body.narp ?? '').trim() || null,
+        ccode,
+        edate,
+        String(body.sdno ?? '').trim() || null,
+        String(body.mont ?? '').trim() || null,
+        String(body.bcode ?? '').trim() || null,
+        String(body.aclas ?? '').trim() || null,
+      ],
+    );
+
+    const siteName = await this.siteName(ccode);
+    await this.activityLog.write({
+      category: 'activity',
+      username,
+      activity: 'Inventory Voucher Saved',
+      description: `Saved ${kind} ${invno}`,
+      module: 'Inventory Voucher',
+      campus: siteName,
+      campusCode: ccode,
+      status: 'Success',
+      meta: { invno, kind },
+    });
+    return { ok: true, message: `Voucher ${invno} saved.`, invno, siteName };
+  }
+
+  /** Delete inventory voucher header (+ any detail lines). */
+  async deleteVoucher(username: string, invnoRaw: string) {
+    const invno = String(invnoRaw ?? '').trim();
+    if (!invno) {
+      return { ok: false, message: 'Invoice no is required.' };
+    }
+
+    const mast = await this.database.query<{ ccode: string }>(
+      `SELECT coalesce(trim(ccode), '') AS ccode
+       FROM purmast WHERE trim(invno) = $1 LIMIT 1`,
+      [invno],
+    );
+    if (!mast.rows[0]) {
+      const fee = await this.database.query<{ ccode: string }>(
+        `SELECT coalesce(trim(ccode), '') AS ccode
+         FROM accmast WHERE trim(invno) = $1 LIMIT 1`,
+        [invno],
+      );
+      if (!fee.rows[0]) {
+        return { ok: false, message: `Invoice ${invno} not found.` };
+      }
+      const feeScope = await this.siteScope(username, fee.rows[0].ccode);
+      if (!feeScope) {
+        return { ok: false, message: 'Not allowed to delete this voucher.' };
+      }
+      await this.database.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
+      await this.database.query(`DELETE FROM accmast WHERE trim(invno) = $1`, [invno]);
+      return { ok: true, message: `Voucher ${invno} deleted.`, invno };
+    }
+
+    const scope = await this.siteScope(username, mast.rows[0].ccode);
+    if (!scope) {
+      return { ok: false, message: 'Not allowed to delete this voucher.' };
+    }
+
+    const det = await this.database.query(
+      `DELETE FROM purdet WHERE trim(invno) = $1`,
+      [invno],
+    );
+    await this.database.query(`DELETE FROM purmast WHERE trim(invno) = $1`, [invno]);
+
+    const siteName = await this.siteName(mast.rows[0].ccode);
+    await this.activityLog.write({
+      category: 'activity',
+      username,
+      activity: 'Inventory Voucher Deleted',
+      description: `Deleted inventory voucher ${invno}`,
+      module: 'Inventory Voucher',
+      campus: siteName,
+      campusCode: mast.rows[0].ccode,
+      status: 'Success',
+      meta: { invno, detailLines: det.rowCount ?? 0 },
+    });
+
+    return { ok: true, message: `Voucher ${invno} deleted.`, invno };
+  }
+
+  /**
+   * Next invoice no for purmast by ESS suffix (P/R/S/N) — same sequence as Add Stock.
+   * Example: last 000626P → 000627P.
+   */
+  async nextInvoice(suffixRaw = 'P') {
+    const suffix = String(suffixRaw || 'P')
+      .trim()
+      .toUpperCase()
+      .slice(-1);
+    const letter = /[PRSNFG]/.test(suffix) ? suffix : 'P';
+    const table = letter === 'G' || letter === 'F' ? 'accmast' : 'purmast';
+    const next = await this.database.query<{ n: string; last: string | null }>(
+      `SELECT (coalesce(
+         max(nullif(regexp_replace(trim(invno), '[^0-9]', '', 'g'), '')::bigint),
+         0
+       ) + 1)::text AS n,
+       max(trim(invno)) AS last
+       FROM ${table}
+       WHERE right(upper(trim(invno)), 1) = $1`,
+      [letter],
+    );
+    const seq = Number(next.rows[0]?.n ?? 1);
+    const invno = `${String(seq).padStart(6, '0')}${letter}`;
+    return {
+      ok: true,
+      suffix: letter,
+      lastInvno: next.rows[0]?.last || null,
+      invno,
+    };
+  }
+
   /**
    * Stock adjustment: In → next …P voucher, Out → next …S voucher.
    * Writes purmast + purdet (ESS purchase/stock movement tables).
@@ -1236,9 +1708,9 @@ export class InventoryControlService {
     const invno = `${String(seq).padStart(6, '0')}${suffix}`;
 
     await this.database.query(
-      `INSERT INTO purmast (invno, ccode, invdate, narp, pflag)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [invno, ccode, moveDate, `Stock ${moveType} (ERP)`, '1'],
+      `INSERT INTO purmast (invno, ccode, invdate, pflag)
+       VALUES ($1, $2, $3, $4)`,
+      [invno, ccode, moveDate, '1'],
     );
 
     await this.database.query(

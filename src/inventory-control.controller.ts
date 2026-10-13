@@ -65,6 +65,71 @@ export class InventoryControlController {
     );
   }
 
+  /** Next purmast invoice (ESS …P / …R / …S / …N). */
+  @Get('next-invoice')
+  nextInvoice(@Query('suffix') suffix?: string) {
+    return this.inventory.nextInvoice(suffix ?? 'P');
+  }
+
+  /** Inventory Voucher list (purmast headers). */
+  @Get('vouchers')
+  vouchers(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('suffix') suffix?: string,
+    @Query('kind') kind?: string,
+    @Query('site') site?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.inventory.listVouchers(
+      user ?? '',
+      suffix ?? '',
+      Number(page) || 1,
+      Number(pageSize) || 50,
+      kind ?? '',
+      site ?? '',
+    );
+  }
+
+  /** Save Inventory Voucher header to purmast. */
+  @Post('vouchers')
+  saveVoucher(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body()
+    body: {
+      invno?: string;
+      invdate?: string;
+      ccode?: string;
+      pcode?: string;
+      dparty?: string;
+      pinv?: string;
+      gno?: string;
+      pday?: string;
+      narp?: string;
+      frt?: string;
+      discount?: string;
+      pflag?: string;
+      suffix?: string;
+      kind?: string;
+      sdno?: string;
+      mont?: string;
+      bcode?: string;
+      aclas?: string;
+      edate?: string;
+    },
+  ) {
+    return this.inventory.saveVoucher(user ?? '', body ?? {});
+  }
+
+  /** Delete Inventory Voucher. */
+  @Delete('vouchers')
+  deleteVoucher(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { invno?: string },
+  ) {
+    return this.inventory.deleteVoucher(user ?? '', body?.invno ?? '');
+  }
+
   /** Full stock / purchase voucher by invoice no (for PDF download). */
   @Get('invoice')
   invoice(
