@@ -7,8 +7,12 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
   app.use(json({ limit: '6mb' }));
   app.use(urlencoded({ extended: true, limit: '6mb' }));
+  const corsOrigin = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
   app.enableCors({
-    origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
+    origin: corsOrigin,
     credentials: true,
     allowedHeaders: ['Content-Type', 'x-ess-user'],
   });

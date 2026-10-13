@@ -5,6 +5,9 @@ import { Pool, PoolClient, QueryResultRow } from 'pg';
 export class DatabaseService implements OnModuleDestroy {
   readonly pool = new Pool({
     connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL?.includes('rds.amazonaws.com')
+      ? { rejectUnauthorized: false }
+      : undefined,
   });
 
   query<T extends QueryResultRow = QueryResultRow>(text: string, params?: unknown[]) {
