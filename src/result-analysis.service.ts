@@ -75,6 +75,8 @@ export class ResultAnalysisService {
     const statusScope = siblingsOnly || employeeChildOnly ? 'Active' : status.trim();
     const fromScope = /^\d{4}-\d{2}-\d{2}$/.test(fromDate.trim()) ? fromDate.trim() : '';
     const toScope = /^\d{4}-\d{2}-\d{2}$/.test(toDate.trim()) ? toDate.trim() : '';
+    // Zone roots SRA/MTZ/TSC — also match sdno prefix (same as Students Register).
+    const zoneRoot = /^(1401|1402|1403)$/.test(scope) ? scope : '';
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 500);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
@@ -87,6 +89,7 @@ export class ResultAnalysisService {
       statusScope,
       fromScope,
       toScope,
+      zoneRoot ? `${zoneRoot}%` : '',
     ];
 
     // Uses student.fnic_norm + indexes (stat, ccode) — avoids per-row regexp_replace.
@@ -164,6 +167,7 @@ export class ResultAnalysisService {
     // Register / admission date (student.adate) — text like "YYYY-MM-DD HH:MM:SS".
     const where = `
       WHERE s.ccode LIKE $1
+        AND ($9 = '' OR trim(s.sdno) LIKE $9)
         AND ($2 = '' OR s.class LIKE $2)
         AND ($3 = '' OR s.sec LIKE $3)
         AND ($4 = '' OR s.name ILIKE $5 OR s.rollno ILIKE $5 OR s.sdno ILIKE $5 OR s.cellno ILIKE $5 OR s.fname ILIKE $5 OR s.fnic ILIKE $5)
@@ -288,7 +292,7 @@ export class ResultAnalysisService {
        LEFT JOIN acc se ON se.acode = s.sec
        ${where}
        ${orderBy}
-       LIMIT $9 OFFSET $10`,
+       LIMIT $10 OFFSET $11`,
       [...params, size, offset],
     );
 

@@ -297,11 +297,24 @@ export class RegistrationService {
     return `${prefix}${num}${suffix}`;
   }
 
+  /** SRA/MTZ/TSC root from site/zone code (1401… → 1401). */
+  private zoneRootCode(siteOrScope: string) {
+    const digits = String(siteOrScope || '').trim().replace(/\D/g, '');
+    const m = digits.match(/^(1401|1402|1403)/);
+    return m ? m[1] : '';
+  }
+
   async nextStudentCode(username: string, site: string) {
     const scope = await this.siteScope(username, site);
+    const zoneRoot = this.zoneRootCode(scope || site);
     const params: unknown[] = [];
     const where = [`coalesce(trim(st.sdno), '') <> ''`];
-    if (scope) {
+    // Always key next ID off student-code zone prefix (not ccode), so a 1403-*
+    // student parked on an SRA campus cannot produce the next SRA registration ID.
+    if (zoneRoot) {
+      params.push(`${zoneRoot}%`);
+      where.push(`trim(st.sdno) LIKE $${params.length}`);
+    } else if (scope) {
       params.push(`${scope}%`);
       where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
     }
@@ -315,7 +328,7 @@ export class RegistrationService {
       params,
     );
     const last = String(rows.rows[0]?.sdno || '').trim();
-    const code = this.bumpStudentCode(last, scope || site);
+    const code = this.bumpStudentCode(last, zoneRoot || scope || site);
     return { ok: true, code, lastCode: last };
   }
 
