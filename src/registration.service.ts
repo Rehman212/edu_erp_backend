@@ -126,14 +126,24 @@ export class RegistrationService {
       where.push(`upper(trim(coalesce(st.stat, ''))) = upper($${params.length})`);
     }
     if (q.trim()) {
-      params.push(`%${q.trim()}%`);
-      where.push(
-        `(st.sdno ILIKE $${params.length}
-          OR st.rollno ILIKE $${params.length}
-          OR st.name ILIKE $${params.length}
-          OR st.fname ILIKE $${params.length}
-          OR st.cellno ILIKE $${params.length})`,
-      );
+      // AHMED / AHMAD (and spaced variants) are often the same father in ESS data.
+      const rawQ = q.trim();
+      const variants = new Set<string>([rawQ]);
+      if (/ahmed/i.test(rawQ)) variants.add(rawQ.replace(/ahmed/gi, 'Ahmad'));
+      if (/ahmad/i.test(rawQ)) variants.add(rawQ.replace(/ahmad/gi, 'Ahmed'));
+      const qParts: string[] = [];
+      for (const v of variants) {
+        params.push(`%${v}%`);
+        const i = params.length;
+        qParts.push(
+          `(st.sdno ILIKE $${i}
+            OR st.rollno ILIKE $${i}
+            OR st.name ILIKE $${i}
+            OR st.fname ILIKE $${i}
+            OR st.cellno ILIKE $${i})`,
+        );
+      }
+      where.push(`(${qParts.join(' OR ')})`);
     }
 
     const count = await this.database.query<{
