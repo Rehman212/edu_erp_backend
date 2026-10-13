@@ -1,0 +1,1950 @@
+import { Injectable } from '@nestjs/common';
+import { ActivityLogService } from './activity-log.service';
+import { DatabaseService } from './database.service';
+
+export type TbNode = {
+  code: string;
+  name: string;
+  debit: number;
+  credit: number;
+  balance: number;
+  flag: string;
+  children: TbNode[];
+};
+
+/** Avoid trim() on join/filter columns — it disables btree indexes (was ~3s → ~0.4s). */
+const NUM = (alias: string, col: string) =>
+  `CASE WHEN coalesce(${alias}.${col}, '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ${alias}.${col}::numeric ELSE 0 END`;
+
+@Injectable()
+export class FinancialControlService {
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly activityLog: ActivityLogService,
+  ) {}
+
+  private readonly debitSql = NUM('d', 'dr');
+  private readonly creditSql = NUM('d', 'cr');
+
+  /** Lexicographic range on text invdate ('YYYY-MM-DD …'). toExclusive = day after toDate. */
+  private periodBounds(fromDate: string, toDate: string) {
+    const from = this.normDate(fromDate) || this.monthStart();
+    const to = this.normDate(toDate) || this.today();
+    return { from, to, toExclusive: this.nextDay(to) };
+  }
+
+  async sites(username: string) {
+    const zone = await this.zonePrefix(username);
+    const rows = await this.database.query<{ code: string; name: string }>(
+      `SELECT trim(a.acode) AS code, trim(a.ahead) AS name
+       FROM acc a
+       WHERE a.acode LIKE '14%'
+         AND ($1 = '' OR a.acode = $1 OR a.acode LIKE $1 || '%')
+       ORDER BY a.acode`,
+      [zone],
+    );
+    return rows.rows;
+  }
+
+  async accounts(q = '', limit = 500, scope = '') {
+    const search = q.trim().replace(/%/g, '');
+    const size = Math.min(Math.max(Number(limit) || 500, 1), 5000);
+    const feeScope = scope.trim().toLowerCase() === 'fee';
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      flag: string;
+    }>(
+      `SELECT trim(a.acode) AS code,
+              coalesce(nullif(trim(a.ahead), ''), trim(a.acode)) AS name,
+              coalesce(trim(a.flag), '') AS flag
+       FROM acc a
+       WHERE coalesce(trim(a.acode), '') <> ''
+         AND (
+           NOT $3::boolean
+           OR a.acode LIKE '150201%'
+           OR a.acode LIKE '1506%'
+         )
+         AND (
+           $1 = ''
+           OR a.acode ILIKE '%' || $1 || '%'
+           OR a.ahead ILIKE '%' || $1 || '%'
+         )
+       ORDER BY
+         CASE WHEN $3::boolean THEN a.acode ELSE upper(trim(a.ahead)) END,
+         a.acode
+       LIMIT $2`,
+      [search, size, feeScope],
+    );
+    return rows.rows;
+  }
+
+  async trialBalance(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    q = '',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    const search = q.trim().replace(/%/g, '');
+
+    const leaf = await this.database.query<{
+      acode: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT d.acode AS acode,
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND coalesce(d.acode, '') <> ''
+       GROUP BY d.acode`,
+      [from, toExclusive, scope],
+    );
+
+    const balMap = new Map<string, { debit: number; credit: number }>();
+    for (const row of leaf.rows) {
+      const code = row.acode.trim();
+      if (!code) continue;
+      const debit = Number(row.debit) || 0;
+      const credit = Number(row.credit) || 0;
+      if (!debit && !credit) continue;
+      balMap.set(code, { debit, credit });
+      // roll up to every parent prefix used in COA (1, 11, 1101, …)
+      for (const parent of this.parentCodes(code)) {
+        const cur = balMap.get(parent) || { debit: 0, credit: 0 };
+        cur.debit += debit;
+        cur.credit += credit;
+        balMap.set(parent, cur);
+      }
+    }
+
+    const codes = [...balMap.keys()];
+    if (!codes.length) {
+      return {
+        roots: [] as TbNode[],
+        totals: { debit: 0, credit: 0, balance: 0 },
+        meta: { site: scope, fromDate: from, toDate: to, accountCount: 0 },
+      };
+    }
+
+    const heads = await this.database.query<{
+      code: string;
+      name: string;
+      flag: string;
+    }>(
+      `SELECT trim(acode) AS code,
+              coalesce(nullif(trim(ahead), ''), trim(acode)) AS name,
+              coalesce(trim(flag), '') AS flag
+       FROM acc
+       WHERE trim(acode) = ANY($1::text[])`,
+      [codes],
+    );
+    const nameMap = new Map(
+      heads.rows.map((h) => [h.code, { name: h.name, flag: h.flag }]),
+    );
+
+    const nodeMap = new Map<string, TbNode>();
+    for (const [code, bal] of balMap) {
+      const meta = nameMap.get(code);
+      if (search) {
+        const hay = `${code} ${meta?.name || ''}`.toLowerCase();
+        if (!hay.includes(search.toLowerCase()) && !this.hasMatchingDescendant(code, balMap, nameMap, search)) {
+          // keep ancestors of matches — filter after tree build
+        }
+      }
+      nodeMap.set(code, {
+        code,
+        name: meta?.name || code,
+        debit: round2(bal.debit),
+        credit: round2(bal.credit),
+        balance: round2(bal.debit - bal.credit),
+        flag: meta?.flag || '',
+        children: [],
+      });
+    }
+
+    const roots: TbNode[] = [];
+    const sorted = [...nodeMap.values()].sort((a, b) =>
+      a.code.localeCompare(b.code, undefined, { numeric: true }),
+    );
+    for (const node of sorted) {
+      const parent = this.nearestParent(node.code, nodeMap);
+      if (parent) parent.children.push(node);
+      else roots.push(node);
+    }
+
+    const filtered = search
+      ? this.filterTree(roots, search)
+      : roots.filter((n) => n.code.length === 1 || ['1', '2', '3', '4'].includes(n.code));
+
+    // Prefer top-level 1/2/3/4 when no search
+    const displayRoots = search
+      ? filtered
+      : ['1', '2', '3', '4']
+          .map((c) => nodeMap.get(c))
+          .filter((n): n is TbNode => Boolean(n));
+
+    const totals = displayRoots.reduce(
+      (acc, n) => {
+        acc.debit += n.debit;
+        acc.credit += n.credit;
+        acc.balance += n.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+
+    return {
+      roots: displayRoots,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        accountCount: balMap.size,
+      },
+    };
+  }
+
+  async ledger(
+    username: string,
+    acodeRaw: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    page = 1,
+    pageSize = 50,
+  ) {
+    const acode = acodeRaw.trim();
+    if (!acode) {
+      return {
+        account: null,
+        rows: [],
+        total: 0,
+        page: 1,
+        pageSize,
+        opening: 0,
+        totals: { debit: 0, credit: 0, balance: 0 },
+      };
+    }
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+
+    const head = await this.database.query<{
+      code: string;
+      name: string;
+      flag: string;
+    }>(
+      `SELECT trim(acode) AS code, trim(ahead) AS name, coalesce(trim(flag),'') AS flag
+       FROM acc WHERE acode = $1 LIMIT 1`,
+      [acode],
+    );
+
+    // Group heads (e.g. 15 Current Assets) include all child postings via prefix.
+    const acodeSql = `(d.acode = $1 OR d.acode LIKE $1 || '%')`;
+
+    const opening = await this.database.query<{ bal: string }>(
+      `SELECT coalesce(sum(${this.debitSql} - ${this.creditSql}), 0)::text AS bal
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${acodeSql}
+         AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')`,
+      [acode, from, scope],
+    );
+    const openBal = Number(opening.rows[0]?.bal) || 0;
+
+    const count = await this.database.query<{ total: string }>(
+      `SELECT count(*)::text AS total
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${acodeSql}
+         AND m.invdate >= $2 AND m.invdate < $3
+         AND ($4 = '' OR m.ccode LIKE $4 || '%')`,
+      [acode, from, toExclusive, scope],
+    );
+
+    const lines = await this.database.query<{
+      invno: string;
+      invdate: string;
+      narr: string;
+      debit: string;
+      credit: string;
+      siteCode: string;
+      mont: string;
+    }>(
+      `SELECT d.invno AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(nullif(trim(d.snar), ''), nullif(trim(m.nar), ''), '') AS narr,
+              (${this.debitSql})::text AS debit,
+              (${this.creditSql})::text AS credit,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(m.mont, '') AS mont
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${acodeSql}
+         AND m.invdate >= $2 AND m.invdate < $3
+         AND ($4 = '' OR m.ccode LIKE $4 || '%')
+       ORDER BY m.invdate, d.row_id
+       LIMIT $5 OFFSET $6`,
+      [acode, from, toExclusive, scope, size, offset],
+    );
+
+    let running = openBal;
+    if (offset > 0) {
+      const prior = await this.database.query<{ bal: string }>(
+        `SELECT coalesce(sum(x.d - x.c), 0)::text AS bal FROM (
+           SELECT ${this.debitSql} AS d, ${this.creditSql} AS c
+           FROM accdet d
+           JOIN accmast m ON m.invno = d.invno
+           WHERE ${acodeSql}
+             AND m.invdate >= $2 AND m.invdate < $3
+             AND ($4 = '' OR m.ccode LIKE $4 || '%')
+           ORDER BY m.invdate, d.row_id
+           LIMIT $5
+         ) x`,
+        [acode, from, toExclusive, scope, offset],
+      );
+      running = openBal + (Number(prior.rows[0]?.bal) || 0);
+    }
+
+    const rows = lines.rows.map((row) => {
+      const debit = Number(row.debit) || 0;
+      const credit = Number(row.credit) || 0;
+      running += debit - credit;
+      return {
+        invno: row.invno,
+        date: row.invdate,
+        narration: row.narr,
+        debit: round2(debit),
+        credit: round2(credit),
+        balance: round2(running),
+        siteCode: row.siteCode,
+        mont: row.mont,
+      };
+    });
+
+    const period = await this.database.query<{
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${acodeSql}
+         AND m.invdate >= $2 AND m.invdate < $3
+         AND ($4 = '' OR m.ccode LIKE $4 || '%')`,
+      [acode, from, toExclusive, scope],
+    );
+    const pDebit = Number(period.rows[0]?.debit) || 0;
+    const pCredit = Number(period.rows[0]?.credit) || 0;
+
+    return {
+      account: head.rows[0] || { code: acode, name: acode, flag: '' },
+      rows,
+      total: Number(count.rows[0]?.total) || 0,
+      page: current,
+      pageSize: size,
+      opening: round2(openBal),
+      totals: {
+        debit: round2(pDebit),
+        credit: round2(pCredit),
+        balance: round2(openBal + pDebit - pCredit),
+      },
+      meta: { site: scope, fromDate: from, toDate: to },
+    };
+  }
+
+  async cashBook(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    account = '150601',
+    page = 1,
+    pageSize = 50,
+  ) {
+    const code = account.trim() || '150601';
+    return this.ledger(username, code, site, fromDate, toDate, page, pageSize);
+  }
+
+  async bankSummary(username: string, site: string, fromDate: string, toDate: string) {
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT d.acode AS code,
+              coalesce(max(a.ahead), d.acode) AS name,
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN acc a ON a.acode = d.acode
+       WHERE d.acode LIKE '150602%'
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+       GROUP BY d.acode
+       ORDER BY d.acode`,
+      [from, toExclusive, scope],
+    );
+
+    const list = rows.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      return {
+        code: r.code,
+        name: r.name,
+        debit: round2(debit),
+        credit: round2(credit),
+        balance: round2(debit - credit),
+      };
+    });
+    const totals = list.reduce(
+      (acc, r) => {
+        acc.debit += r.debit;
+        acc.credit += r.credit;
+        acc.balance += r.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+    return {
+      rows: list,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: { site: scope, fromDate: from, toDate: to },
+    };
+  }
+
+  /**
+   * C.E — Ledger Sitewise: selected account head totals broken by campus (ccode).
+   */
+  async ledgerSitewise(
+    username: string,
+    acodeRaw: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+  ) {
+    const acode = acodeRaw.trim();
+    if (!acode) {
+      return {
+        rows: [],
+        totals: { debit: 0, credit: 0, balance: 0 },
+        meta: { site: '', fromDate: '', toDate: '', acode: '' },
+      };
+    }
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    const acodeSql = `(d.acode = $1 OR d.acode LIKE $1 || '%')`;
+
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(nullif(trim(m.ccode), ''), '—') AS code,
+              coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '—') AS name,
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN acc camp ON camp.acode = m.ccode
+       WHERE ${acodeSql}
+         AND m.invdate >= $2 AND m.invdate < $3
+         AND ($4 = '' OR m.ccode LIKE $4 || '%')
+       GROUP BY coalesce(nullif(trim(m.ccode), ''), '—'),
+                coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '—')
+       ORDER BY 1`,
+      [acode, from, toExclusive, scope],
+    );
+
+    const list = rows.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      return {
+        code: r.code,
+        name: r.name,
+        debit: round2(debit),
+        credit: round2(credit),
+        balance: round2(debit - credit),
+      };
+    });
+    const totals = list.reduce(
+      (acc, r) => {
+        acc.debit += r.debit;
+        acc.credit += r.credit;
+        acc.balance += r.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+    return {
+      rows: list,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: { site: scope, fromDate: from, toDate: to, acode },
+    };
+  }
+
+  /**
+   * C.F — Main Sub Ledger: selected head + child accounts with period movement.
+   */
+  async mainSubLedger(
+    username: string,
+    acodeRaw: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+  ) {
+    const acode = acodeRaw.trim();
+    if (!acode) {
+      return {
+        rows: [],
+        totals: { debit: 0, credit: 0, balance: 0 },
+        meta: { site: '', fromDate: '', toDate: '', acode: '' },
+      };
+    }
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT trim(a.acode) AS code,
+              coalesce(nullif(trim(a.ahead), ''), trim(a.acode)) AS name,
+              coalesce(x.debit, 0)::text AS debit,
+              coalesce(x.credit, 0)::text AS credit
+       FROM acc a
+       LEFT JOIN (
+         SELECT d.acode AS acode,
+                coalesce(sum(${this.debitSql}), 0) AS debit,
+                coalesce(sum(${this.creditSql}), 0) AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate >= $2 AND m.invdate < $3
+           AND ($4 = '' OR m.ccode LIKE $4 || '%')
+           AND (d.acode = $1 OR d.acode LIKE $1 || '%')
+         GROUP BY d.acode
+       ) x ON x.acode = a.acode
+       WHERE a.acode = $1
+          OR a.acode LIKE $1 || '%'
+       ORDER BY a.acode
+       LIMIT 2000`,
+      [acode, from, toExclusive, scope],
+    );
+
+    const list = rows.rows
+      .map((r) => {
+        const debit = Number(r.debit) || 0;
+        const credit = Number(r.credit) || 0;
+        const isMain = r.code === acode;
+        return {
+          code: r.code,
+          name: r.name,
+          level: isMain ? 'Main' : 'Sub',
+          debit: round2(debit),
+          credit: round2(credit),
+          balance: round2(debit - credit),
+        };
+      })
+      .filter((r) => r.debit !== 0 || r.credit !== 0);
+
+    const hasSubs = list.some((r) => r.level === 'Sub');
+    const totals = list.reduce(
+      (acc, r) => {
+        if (r.level === 'Main' && hasSubs) return acc;
+        acc.debit += r.debit;
+        acc.credit += r.credit;
+        acc.balance += r.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+
+    return {
+      rows: list,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: { site: scope, fromDate: from, toDate: to, acode },
+    };
+  }
+
+  /**
+   * H.A — Site Summary: campus-wise debit / credit / balance for period.
+   */
+  async siteSummary(username: string, site: string, fromDate: string, toDate: string) {
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(nullif(trim(m.ccode), ''), '—') AS code,
+              coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '—') AS name,
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN acc camp ON camp.acode = m.ccode
+       WHERE m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND coalesce(nullif(trim(m.ccode), ''), '') <> ''
+       GROUP BY coalesce(nullif(trim(m.ccode), ''), '—'),
+                coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '—')
+       ORDER BY 1`,
+      [from, toExclusive, scope],
+    );
+
+    const list = rows.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      return {
+        code: r.code,
+        name: r.name,
+        debit: round2(debit),
+        credit: round2(credit),
+        balance: round2(debit - credit),
+      };
+    });
+    const totals = list.reduce(
+      (acc, r) => {
+        acc.debit += r.debit;
+        acc.credit += r.credit;
+        acc.balance += r.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+    return {
+      rows: list,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: { site: scope, fromDate: from, toDate: to },
+    };
+  }
+
+  /**
+   * C.J — Subsidiary List: child accounts under selected group with balances.
+   */
+  async subsidiaryList(
+    username: string,
+    acodeRaw: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+  ) {
+    const acode = acodeRaw.trim();
+    if (!acode) {
+      return {
+        rows: [],
+        totals: { debit: 0, credit: 0, balance: 0 },
+        meta: { site: '', fromDate: '', toDate: '', acode: '' },
+      };
+    }
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+
+    const rows = await this.database.query<{
+      code: string;
+      name: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT trim(a.acode) AS code,
+              coalesce(nullif(trim(a.ahead), ''), trim(a.acode)) AS name,
+              coalesce(x.debit, 0)::text AS debit,
+              coalesce(x.credit, 0)::text AS credit
+       FROM acc a
+       LEFT JOIN (
+         SELECT d.acode AS acode,
+                coalesce(sum(${this.debitSql}), 0) AS debit,
+                coalesce(sum(${this.creditSql}), 0) AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate >= $2 AND m.invdate < $3
+           AND ($4 = '' OR m.ccode LIKE $4 || '%')
+           AND d.acode LIKE $1 || '%'
+           AND d.acode <> $1
+         GROUP BY d.acode
+       ) x ON x.acode = a.acode
+       WHERE a.acode LIKE $1 || '%'
+         AND a.acode <> $1
+       ORDER BY a.acode
+       LIMIT 3000`,
+      [acode, from, toExclusive, scope],
+    );
+
+    const list = rows.rows
+      .map((r) => {
+        const debit = Number(r.debit) || 0;
+        const credit = Number(r.credit) || 0;
+        return {
+          code: r.code,
+          name: r.name,
+          debit: round2(debit),
+          credit: round2(credit),
+          balance: round2(debit - credit),
+        };
+      })
+      .filter((r) => r.debit !== 0 || r.credit !== 0);
+    const totals = list.reduce(
+      (acc, r) => {
+        acc.debit += r.debit;
+        acc.credit += r.credit;
+        acc.balance += r.balance;
+        return acc;
+      },
+      { debit: 0, credit: 0, balance: 0 },
+    );
+    return {
+      rows: list,
+      totals: {
+        debit: round2(totals.debit),
+        credit: round2(totals.credit),
+        balance: round2(totals.balance),
+      },
+      meta: { site: scope, fromDate: from, toDate: to, acode },
+    };
+  }
+
+  async feeCollection(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    montFrom = '',
+    montTo = '',
+    page = 1,
+    pageSize = 50,
+    status = 'ALL',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const fromKey = toYyyymm(montFrom);
+    const toKey = toYyyymm(montTo || montFrom);
+    // Legacy H.P: Months From/To drive the period. If only dates set, use those.
+    let { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    if (fromKey || toKey) {
+      const span = monthKeysToDateSpan(fromKey || toKey, toKey || fromKey);
+      from = span.from;
+      to = span.to;
+      toExclusive = span.toExclusive;
+    }
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+    // accmast.mont is MMYYYY — compare as YYYYMM for From/To range (legacy Months).
+    const montExpr = `(right(trim(m.mont), 4) || left(trim(m.mont), 2))`;
+    /** Legacy UI: Active / Left / Migrate / ALL. DB uses Transfered for Migrate. */
+    const statusKey = String(status || 'ALL').trim();
+    const statusDb =
+      !statusKey || statusKey.toUpperCase() === 'ALL'
+        ? ''
+        : statusKey.toLowerCase() === 'migrate'
+          ? 'Transfered'
+          : statusKey;
+    const statusFilter = statusDb
+      ? `AND EXISTS (
+           SELECT 1 FROM student st
+           WHERE st.sdno = m.sdno AND trim(st.stat) = $6
+         )`
+      : '';
+    const countParams: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    if (statusDb) countParams.push(statusDb);
+
+    const count = await this.database.query<{ total: string; amount: string }>(
+      `SELECT count(*)::text AS total,
+              coalesce(sum(x.amt), 0)::text AS amount
+       FROM (
+         SELECT coalesce(sum(${this.debitSql}), 0) AS amt
+         FROM accmast m
+         JOIN accdet d ON d.invno = m.invno
+         WHERE right(m.invno, 1) = 'F'
+           AND m.invdate >= $1 AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+           AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+           ${statusFilter}
+         GROUP BY m.invno
+       ) x`,
+      countParams,
+    );
+
+    const rowParams: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    const statusRowFilter = statusDb
+      ? `AND EXISTS (
+           SELECT 1 FROM student st
+           WHERE st.sdno = m.sdno AND trim(st.stat) = $6
+         )`
+      : '';
+    if (statusDb) rowParams.push(statusDb);
+    const limitIdx = rowParams.length + 1;
+    const offsetIdx = rowParams.length + 2;
+    rowParams.push(size, offset);
+
+    const rows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      narr: string;
+      siteCode: string;
+      siteName: string;
+      mont: string;
+      amount: string;
+    }>(
+      `SELECT m.invno AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(m.nar, '') AS narr,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
+              coalesce(m.mont, '') AS mont,
+              coalesce(sum(${this.debitSql}), 0)::text AS amount
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       LEFT JOIN acc s ON s.acode = m.ccode
+       WHERE right(m.invno, 1) = 'F'
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+         ${statusRowFilter}
+       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont
+       ORDER BY m.invdate DESC, m.invno DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      rowParams,
+    );
+
+    return {
+      rows: rows.rows.map((r) => ({
+        invno: r.invno,
+        date: r.invdate,
+        narration: r.narr,
+        siteCode: r.siteCode,
+        siteName: r.siteName,
+        mont: r.mont,
+        amount: round2(Number(r.amount) || 0),
+      })),
+      total: Number(count.rows[0]?.total) || 0,
+      totalAmount: round2(Number(count.rows[0]?.amount) || 0),
+      page: current,
+      pageSize: size,
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        montFrom: montFrom.trim(),
+        montTo: (montTo || montFrom).trim(),
+        status: statusKey || 'ALL',
+      },
+    };
+  }
+
+  /**
+   * H.N / H.X — student-wise fee receivable outstanding (not account heads).
+   * Net debit on 150201% linked via accmast.sdno → student.
+   */
+  async defaulters(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    page = 1,
+    pageSize = 50,
+    status = 'ALL',
+    montFrom = '',
+    montTo = '',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const fromKey = toYyyymm(montFrom);
+    const toKey = toYyyymm(montTo || montFrom);
+    let { from, to, toExclusive } = this.periodBounds(
+      fromDate || '2020-01-01',
+      toDate,
+    );
+    if (fromKey || toKey) {
+      const span = monthKeysToDateSpan(fromKey || toKey, toKey || fromKey);
+      from = span.from;
+      to = span.to;
+      toExclusive = span.toExclusive;
+    }
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+
+    const statusKey = String(status || 'ALL').trim();
+    const statusDb =
+      !statusKey || statusKey.toUpperCase() === 'ALL'
+        ? ''
+        : statusKey.toLowerCase() === 'migrate'
+          ? 'Transfered'
+          : statusKey;
+
+    const params: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    let statusClause = '';
+    if (statusDb) {
+      params.push(statusDb);
+      statusClause = `AND trim(st.stat) = $${params.length}`;
+    }
+
+    const montYm = `(right(trim(m.mont), 4) || left(trim(m.mont), 2))`;
+
+    const all = await this.database.query<{
+      sdno: string;
+      name: string;
+      status: string;
+      className: string;
+      campus: string;
+      fromDate: string;
+      toDate: string;
+      fromYm: string;
+      toYm: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—') AS name,
+              coalesce(nullif(trim(st.stat), ''), '—') AS status,
+              coalesce(nullif(trim(st.class), ''), '') AS "className",
+              coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '') AS campus,
+              left(min(m.invdate)::text, 10) AS "fromDate",
+              left(max(m.invdate)::text, 10) AS "toDate",
+              min(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "fromYm",
+              max(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "toYm",
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN student st ON st.sdno = m.sdno
+       LEFT JOIN acc camp ON camp.acode = m.ccode
+       WHERE d.acode LIKE '150201%'
+         AND coalesce(nullif(trim(m.sdno), ''), '') <> ''
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montYm} >= $4))
+         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montYm} <= $5))
+         ${statusClause}
+       GROUP BY coalesce(nullif(trim(m.sdno), ''), ''),
+                coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—'),
+                coalesce(nullif(trim(st.stat), ''), '—'),
+                coalesce(nullif(trim(st.class), ''), ''),
+                coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '')
+       HAVING coalesce(sum(${this.debitSql} - ${this.creditSql}), 0) > 0.005
+       ORDER BY coalesce(sum(${this.debitSql} - ${this.creditSql}), 0) DESC`,
+      params,
+    );
+
+    const ymToLabel = (ym: string) => {
+      const v = String(ym || '').replace(/\D/g, '');
+      if (v.length !== 6) return '';
+      return `${v.slice(4, 6)}/${v.slice(0, 4)}`;
+    };
+
+    const mapped = all.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      const fromMont = ymToLabel(r.fromYm);
+      const toMont = ymToLabel(r.toYm);
+      return {
+        code: r.sdno,
+        sdno: r.sdno,
+        name: r.name,
+        status: r.status,
+        className: r.className,
+        campus: r.campus,
+        fromDate: r.fromDate || '',
+        toDate: r.toDate || '',
+        fromMont,
+        toMont,
+        debit: round2(debit),
+        credit: round2(credit),
+        outstanding: round2(debit - credit),
+      };
+    });
+    const slice = mapped.slice(offset, offset + size);
+    const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
+
+    return {
+      rows: slice,
+      total: mapped.length,
+      totalOutstanding: round2(totalOutstanding),
+      page: current,
+      pageSize: size,
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        montFrom: montFrom.trim(),
+        montTo: (montTo || montFrom).trim(),
+        status: statusKey || 'ALL',
+      },
+    };
+  }
+
+  /**
+   * F.H — Fee Register B/W Date: fee bill vouchers (…G) in date range.
+   * Debits on these match Trade Receivable Fees movement in Trial Balance.
+   */
+  async feeRegister(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    page = 1,
+    pageSize = 50,
+    status = 'ALL',
+    montFrom = '',
+    montTo = '',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const fromKey = toYyyymm(montFrom);
+    const toKey = toYyyymm(montTo || montFrom);
+    let { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    if (fromKey || toKey) {
+      const span = monthKeysToDateSpan(fromKey || toKey, toKey || fromKey);
+      from = span.from;
+      to = span.to;
+      toExclusive = span.toExclusive;
+    }
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+    const montExpr = `(right(trim(m.mont), 4) || left(trim(m.mont), 2))`;
+
+    const statusKey = String(status || 'ALL').trim();
+    const statusDb =
+      !statusKey || statusKey.toUpperCase() === 'ALL'
+        ? ''
+        : statusKey.toLowerCase() === 'migrate'
+          ? 'Transfered'
+          : statusKey;
+
+    const params: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    let statusFilter = '';
+    if (statusDb) {
+      params.push(statusDb);
+      statusFilter = `AND EXISTS (
+        SELECT 1 FROM student st
+        WHERE st.sdno = m.sdno AND trim(st.stat) = $${params.length}
+      )`;
+    }
+
+    const count = await this.database.query<{ total: string; amount: string }>(
+      `SELECT count(*)::text AS total,
+              coalesce(sum(x.amt), 0)::text AS amount
+       FROM (
+         SELECT coalesce(sum(${this.debitSql}), 0) AS amt
+         FROM accmast m
+         JOIN accdet d ON d.invno = m.invno
+         WHERE right(trim(m.invno), 1) = 'G'
+           AND m.invdate >= $1 AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+           AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+           ${statusFilter}
+         GROUP BY m.invno
+       ) x`,
+      params,
+    );
+
+    const rowParams = [...params, size, offset];
+    const limitIdx = rowParams.length - 1;
+    const offsetIdx = rowParams.length;
+    const rows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      narr: string;
+      siteCode: string;
+      siteName: string;
+      mont: string;
+      sdno: string;
+      studentName: string;
+      amount: string;
+    }>(
+      `SELECT trim(m.invno) AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(m.nar, '') AS narr,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
+              coalesce(m.mont, '') AS mont,
+              coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), '') AS "studentName",
+              coalesce(sum(${this.debitSql}), 0)::text AS amount
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       LEFT JOIN acc s ON s.acode = m.ccode
+       LEFT JOIN student st ON st.sdno = m.sdno
+       WHERE right(trim(m.invno), 1) = 'G'
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+         ${statusFilter}
+       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont, m.sdno, st.name
+       ORDER BY m.invdate DESC, m.invno DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      rowParams,
+    );
+
+    return {
+      rows: rows.rows.map((r) => ({
+        invno: r.invno,
+        date: r.invdate || '',
+        narration: r.narr,
+        siteCode: r.siteCode,
+        siteName: r.siteName,
+        mont: r.mont,
+        sdno: r.sdno,
+        studentName: r.studentName,
+        amount: round2(Number(r.amount) || 0),
+      })),
+      total: Number(count.rows[0]?.total) || 0,
+      totalAmount: round2(Number(count.rows[0]?.amount) || 0),
+      page: current,
+      pageSize: size,
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        montFrom: montFrom.trim(),
+        montTo: (montTo || montFrom).trim(),
+        status: statusKey || 'ALL',
+      },
+    };
+  }
+
+  /**
+   * H.S — Defaulter List To Month W/O:
+   * outstanding up to fee month, excluding Bad Debts write-off credits (collectible dues).
+   */
+  async defaultersWo(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    montTo: string,
+    page = 1,
+    pageSize = 50,
+    status = 'ALL',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const toKey = toYyyymm(montTo);
+    let { from, to, toExclusive } = this.periodBounds(
+      fromDate || '2020-01-01',
+      toDate,
+    );
+    if (toKey) {
+      const span = monthKeysToDateSpan(toKey, toKey);
+      // Keep wide from-date; cut with mont filter. Dates still bound outer window.
+      to = span.to;
+      toExclusive = span.toExclusive;
+      if (!fromDate) from = '2020-01-01';
+    }
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+
+    const statusKey = String(status || 'ALL').trim();
+    const statusDb =
+      !statusKey || statusKey.toUpperCase() === 'ALL'
+        ? ''
+        : statusKey.toLowerCase() === 'migrate'
+          ? 'Transfered'
+          : statusKey;
+
+    const montYm = `(right(trim(m.mont), 4) || left(trim(m.mont), 2))`;
+    // Bad Debts under cash/bank tree — write-offs must not clear H.S outstanding.
+    const notWriteOff = `AND coalesce(nullif(trim(m.bcode), ''), '') NOT IN ('1506020005', '1506020013', '1506020014')
+      AND coalesce(nullif(trim(d.acode), ''), '') NOT IN ('1506020005', '1506020013', '1506020014')`;
+
+    const params: unknown[] = [from, toExclusive, scope, toKey];
+    let statusClause = '';
+    if (statusDb) {
+      params.push(statusDb);
+      statusClause = `AND trim(st.stat) = $${params.length}`;
+    }
+
+    const all = await this.database.query<{
+      sdno: string;
+      name: string;
+      status: string;
+      className: string;
+      campus: string;
+      fromDate: string;
+      toDate: string;
+      fromYm: string;
+      toYm: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—') AS name,
+              coalesce(nullif(trim(st.stat), ''), '—') AS status,
+              coalesce(nullif(trim(st.class), ''), '') AS "className",
+              coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '') AS campus,
+              left(min(m.invdate)::text, 10) AS "fromDate",
+              left(max(m.invdate)::text, 10) AS "toDate",
+              min(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "fromYm",
+              max(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "toYm",
+              coalesce(sum(${this.debitSql}), 0)::text AS debit,
+              coalesce(sum(${this.creditSql}), 0)::text AS credit
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN student st ON st.sdno = m.sdno
+       LEFT JOIN acc camp ON camp.acode = m.ccode
+       WHERE d.acode LIKE '150201%'
+         AND coalesce(nullif(trim(m.sdno), ''), '') <> ''
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montYm} <= $4))
+         ${notWriteOff}
+         ${statusClause}
+       GROUP BY coalesce(nullif(trim(m.sdno), ''), ''),
+                coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—'),
+                coalesce(nullif(trim(st.stat), ''), '—'),
+                coalesce(nullif(trim(st.class), ''), ''),
+                coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '')
+       HAVING coalesce(sum(${this.debitSql} - ${this.creditSql}), 0) > 0.005
+       ORDER BY coalesce(sum(${this.debitSql} - ${this.creditSql}), 0) DESC`,
+      params,
+    );
+
+    const ymToLabel = (ym: string) => {
+      const v = String(ym || '').replace(/\D/g, '');
+      if (v.length !== 6) return '';
+      return `${v.slice(4, 6)}/${v.slice(0, 4)}`;
+    };
+
+    const mapped = all.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      return {
+        code: r.sdno,
+        sdno: r.sdno,
+        name: r.name,
+        status: r.status,
+        className: r.className,
+        campus: r.campus,
+        fromDate: r.fromDate || '',
+        toDate: r.toDate || '',
+        fromMont: ymToLabel(r.fromYm),
+        toMont: ymToLabel(r.toYm),
+        debit: round2(debit),
+        credit: round2(credit),
+        outstanding: round2(debit - credit),
+      };
+    });
+    const slice = mapped.slice(offset, offset + size);
+    const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
+
+    return {
+      rows: slice,
+      total: mapped.length,
+      totalOutstanding: round2(totalOutstanding),
+      page: current,
+      pageSize: size,
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        montTo: montTo.trim(),
+        status: statusKey || 'ALL',
+      },
+    };
+  }
+
+  /**
+   * H.O — Defaulter List To Banks: outstanding students with last fee-receipt bank (bcode).
+   */
+  async defaultersToBanks(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    page = 1,
+    pageSize = 50,
+    status = 'ALL',
+    montFrom = '',
+    montTo = '',
+  ) {
+    const scope = await this.siteScope(username, site);
+    const fromKey = toYyyymm(montFrom);
+    const toKey = toYyyymm(montTo || montFrom);
+    let { from, to, toExclusive } = this.periodBounds(
+      fromDate || '2020-01-01',
+      toDate,
+    );
+    if (fromKey || toKey) {
+      const span = monthKeysToDateSpan(fromKey || toKey, toKey || fromKey);
+      from = span.from;
+      to = span.to;
+      toExclusive = span.toExclusive;
+    }
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+
+    const statusKey = String(status || 'ALL').trim();
+    const statusDb =
+      !statusKey || statusKey.toUpperCase() === 'ALL'
+        ? ''
+        : statusKey.toLowerCase() === 'migrate'
+          ? 'Transfered'
+          : statusKey;
+
+    const montYm = `(right(trim(m.mont), 4) || left(trim(m.mont), 2))`;
+    const params: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    let statusClause = '';
+    if (statusDb) {
+      params.push(statusDb);
+      statusClause = `AND trim(st.stat) = $${params.length}`;
+    }
+
+    const all = await this.database.query<{
+      sdno: string;
+      name: string;
+      status: string;
+      className: string;
+      campus: string;
+      fromDate: string;
+      toDate: string;
+      fromYm: string;
+      toYm: string;
+      debit: string;
+      credit: string;
+      bankCode: string;
+      bankName: string;
+    }>(
+      `WITH dues AS (
+         SELECT coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+                coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—') AS name,
+                coalesce(nullif(trim(st.stat), ''), '—') AS status,
+                coalesce(nullif(trim(st.class), ''), '') AS "className",
+                coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '') AS campus,
+                left(min(m.invdate)::text, 10) AS "fromDate",
+                left(max(m.invdate)::text, 10) AS "toDate",
+                min(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "fromYm",
+                max(CASE WHEN length(trim(coalesce(m.mont,''))) >= 6 THEN ${montYm} END) AS "toYm",
+                coalesce(sum(${this.debitSql}), 0) AS debit,
+                coalesce(sum(${this.creditSql}), 0) AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         LEFT JOIN student st ON st.sdno = m.sdno
+         LEFT JOIN acc camp ON camp.acode = m.ccode
+         WHERE d.acode LIKE '150201%'
+           AND coalesce(nullif(trim(m.sdno), ''), '') <> ''
+           AND m.invdate >= $1 AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montYm} >= $4))
+           AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montYm} <= $5))
+           ${statusClause}
+         GROUP BY coalesce(nullif(trim(m.sdno), ''), ''),
+                  coalesce(nullif(trim(st.name), ''), nullif(trim(m.nar), ''), m.sdno, '—'),
+                  coalesce(nullif(trim(st.stat), ''), '—'),
+                  coalesce(nullif(trim(st.class), ''), ''),
+                  coalesce(nullif(trim(camp.ahead), ''), nullif(trim(m.ccode), ''), '')
+         HAVING coalesce(sum(${this.debitSql} - ${this.creditSql}), 0) > 0.005
+       ),
+       last_bank AS (
+         SELECT DISTINCT ON (trim(m.sdno))
+                trim(m.sdno) AS sdno,
+                coalesce(nullif(trim(m.bcode), ''), '') AS "bankCode"
+         FROM accmast m
+         WHERE right(trim(m.invno), 1) = 'F'
+           AND coalesce(nullif(trim(m.sdno), ''), '') <> ''
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         ORDER BY trim(m.sdno), m.invdate DESC NULLS LAST, m.row_id DESC
+       )
+       SELECT d.sdno,
+              d.name,
+              d.status,
+              d."className",
+              d.campus,
+              d."fromDate",
+              d."toDate",
+              d."fromYm",
+              d."toYm",
+              d.debit::text AS debit,
+              d.credit::text AS credit,
+              coalesce(nullif(b."bankCode", ''), '—') AS "bankCode",
+              coalesce(nullif(trim(a.ahead), ''), nullif(b."bankCode", ''), '—') AS "bankName"
+       FROM dues d
+       LEFT JOIN last_bank b ON b.sdno = d.sdno
+       LEFT JOIN acc a ON trim(a.acode) = trim(b."bankCode")
+       ORDER BY coalesce(nullif(b."bankCode", ''), '—'),
+                (d.debit - d.credit) DESC`,
+      params,
+    );
+
+    const ymToLabel = (ym: string) => {
+      const v = String(ym || '').replace(/\D/g, '');
+      if (v.length !== 6) return '';
+      return `${v.slice(4, 6)}/${v.slice(0, 4)}`;
+    };
+
+    const mapped = all.rows.map((r) => {
+      const debit = Number(r.debit) || 0;
+      const credit = Number(r.credit) || 0;
+      return {
+        code: r.sdno,
+        sdno: r.sdno,
+        name: r.name,
+        status: r.status,
+        className: r.className,
+        campus: r.campus,
+        fromDate: r.fromDate || '',
+        toDate: r.toDate || '',
+        fromMont: ymToLabel(r.fromYm),
+        toMont: ymToLabel(r.toYm),
+        bankCode: r.bankCode || '—',
+        bankName: r.bankName || '—',
+        debit: round2(debit),
+        credit: round2(credit),
+        outstanding: round2(debit - credit),
+      };
+    });
+    const slice = mapped.slice(offset, offset + size);
+    const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
+
+    return {
+      rows: slice,
+      total: mapped.length,
+      totalOutstanding: round2(totalOutstanding),
+      page: current,
+      pageSize: size,
+      meta: {
+        site: scope,
+        fromDate: from,
+        toDate: to,
+        montFrom: montFrom.trim(),
+        montTo: (montTo || montFrom).trim(),
+        status: statusKey || 'ALL',
+      },
+    };
+  }
+
+  async searchEntries(
+    username: string,
+    site: string,
+    fromDate: string,
+    toDate: string,
+    narration = '',
+    value = '',
+    acode = '',
+    page = 1,
+    pageSize = 50,
+  ) {
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+    const narr = narration.trim().replace(/%/g, '');
+    const val = value.trim();
+    const account = acode.trim();
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+
+    const params: unknown[] = [from, toExclusive, scope];
+    const filters = [
+      `m.invdate >= $1 AND m.invdate < $2`,
+      `($3 = '' OR m.ccode LIKE $3 || '%')`,
+    ];
+    if (narr) {
+      params.push(`%${narr}%`);
+      filters.push(
+        `(coalesce(d.snar,'') ILIKE $${params.length} OR coalesce(m.nar,'') ILIKE $${params.length})`,
+      );
+    }
+    if (val) {
+      params.push(val);
+      filters.push(
+        `(d.dr = $${params.length} OR d.cr = $${params.length} OR d.dr ILIKE $${params.length} || '%' OR d.cr ILIKE $${params.length} || '%')`,
+      );
+    }
+    if (account) {
+      params.push(account);
+      filters.push(`(d.acode = $${params.length} OR d.acode LIKE $${params.length} || '%')`);
+    }
+    const where = filters.join(' AND ');
+    params.push(size, offset);
+
+    const count = await this.database.query<{ total: string }>(
+      `SELECT count(*)::text AS total
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${where}`,
+      params.slice(0, params.length - 2),
+    );
+
+    const rows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      acode: string;
+      ahead: string;
+      narr: string;
+      debit: string;
+      credit: string;
+      siteCode: string;
+    }>(
+      `SELECT d.invno AS invno,
+              left(m.invdate, 10) AS invdate,
+              d.acode AS acode,
+              coalesce(a.ahead, '') AS ahead,
+              coalesce(nullif(trim(d.snar), ''), nullif(trim(m.nar), ''), '') AS narr,
+              (${this.debitSql})::text AS debit,
+              (${this.creditSql})::text AS credit,
+              coalesce(m.ccode, '') AS "siteCode"
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN acc a ON a.acode = d.acode
+       WHERE ${where}
+       ORDER BY m.invdate DESC, d.row_id DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params,
+    );
+
+    return {
+      rows: rows.rows.map((r) => ({
+        invno: r.invno,
+        date: r.invdate,
+        accountCode: r.acode,
+        accountName: r.ahead,
+        narration: r.narr,
+        debit: round2(Number(r.debit) || 0),
+        credit: round2(Number(r.credit) || 0),
+        siteCode: r.siteCode,
+      })),
+      total: Number(count.rows[0]?.total) || 0,
+      page: current,
+      pageSize: size,
+      meta: { site: scope, fromDate: from, toDate: to },
+    };
+  }
+
+  async voucher(username: string, invnoRaw: string) {
+    return this.loadFeeVoucher(username, invnoRaw);
+  }
+
+  async updateVoucher(
+    username: string,
+    body: {
+      invno?: string;
+      invdate?: string;
+      mont?: string;
+      ccode?: string;
+      nar?: string;
+      lines?: Array<{
+        accountCode?: string;
+        debit?: number | string;
+        credit?: number | string;
+        narration?: string;
+      }>;
+    },
+  ) {
+    const invno = String(body.invno || '').trim();
+    if (!invno) return { ok: false, message: 'Invoice required', master: null, lines: [] };
+    if (!invno.toUpperCase().endsWith('F')) {
+      return { ok: false, message: 'Only fee receipts (…F) can be updated here.', master: null, lines: [] };
+    }
+
+    const existing = await this.loadFeeVoucher(username, invno);
+    if (!existing.ok || !existing.master) {
+      return { ok: false, message: existing.message || 'Voucher not found', master: null, lines: [] };
+    }
+
+    const invdate = this.normDate(String(body.invdate || existing.master.invdate));
+    if (!invdate) {
+      return { ok: false, message: 'Valid date (YYYY-MM-DD) is required.', master: null, lines: [] };
+    }
+
+    const montRaw = String(body.mont ?? existing.master.mont ?? '').trim().replace(/\D/g, '');
+    if (montRaw && (montRaw.length !== 6 || !toYyyymm(montRaw))) {
+      return { ok: false, message: 'Month must be MMYYYY (e.g. 102026).', master: null, lines: [] };
+    }
+    const mont = montRaw || existing.master.mont || '';
+
+    const ccode = String(body.ccode ?? existing.master.ccode ?? '').trim();
+    if (!ccode) {
+      return { ok: false, message: 'Campus / site is required.', master: null, lines: [] };
+    }
+    const zone = await this.zonePrefix(username);
+    if (zone && !(ccode === zone || ccode.startsWith(zone))) {
+      return { ok: false, message: 'Campus outside your zone.', master: null, lines: [] };
+    }
+
+    const nar = String(body.nar ?? existing.master.nar ?? '').trim();
+    const rawLines = Array.isArray(body.lines) ? body.lines : [];
+    if (!rawLines.length) {
+      return { ok: false, message: 'At least one voucher line is required.', master: null, lines: [] };
+    }
+
+    const lines: Array<{ accountCode: string; debit: number; credit: number; narration: string }> =
+      [];
+    for (const line of rawLines) {
+      const accountCode = String(line.accountCode || '').trim();
+      if (!accountCode) {
+        return { ok: false, message: 'Every line needs an account code.', master: null, lines: [] };
+      }
+      const debit = round2(Math.max(0, Number(line.debit) || 0));
+      const credit = round2(Math.max(0, Number(line.credit) || 0));
+      if (debit <= 0 && credit <= 0) {
+        return {
+          ok: false,
+          message: `Line ${accountCode} needs a debit or credit amount.`,
+          master: null,
+          lines: [],
+        };
+      }
+      lines.push({
+        accountCode,
+        debit,
+        credit,
+        narration: String(line.narration || '').trim(),
+      });
+    }
+
+    const totalDebit = round2(lines.reduce((s, l) => s + l.debit, 0));
+    const totalCredit = round2(lines.reduce((s, l) => s + l.credit, 0));
+    if (Math.abs(totalDebit - totalCredit) > 0.005) {
+      return {
+        ok: false,
+        message: `Debit (${totalDebit.toFixed(2)}) must equal Credit (${totalCredit.toFixed(2)}).`,
+        master: null,
+        lines: [],
+      };
+    }
+
+    const debitAccount = lines.find((l) => l.debit > 0)?.accountCode || '';
+    const creditAccount = lines.find((l) => l.credit > 0)?.accountCode || '';
+    const uname = username.trim() || existing.master.uname || '';
+    const invdateStore = `${invdate} 00:00:00`;
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        await client.query(
+          `UPDATE accmast
+           SET invdate = $2,
+               mont = $3,
+               ccode = $4,
+               nar = $5,
+               uname = $6,
+               bcode = CASE WHEN $7 = '' THEN bcode ELSE $7 END,
+               u4 = CASE WHEN $8 = '' THEN u4 ELSE $8 END,
+               edate = $2
+           WHERE trim(invno) = $1`,
+          [invno, invdateStore, mont, ccode, nar, uname, debitAccount, creditAccount],
+        );
+        await client.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
+        for (const line of lines) {
+          await client.query(
+            `INSERT INTO accdet (invno, acode, dr, cr, snar)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              invno,
+              line.accountCode,
+              String(line.debit),
+              String(line.credit),
+              line.narration || null,
+            ],
+          );
+        }
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to update voucher.';
+      return { ok: false, message, master: null, lines: [] };
+    }
+
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Fee Receipt Updated',
+      description: `Updated fee receipt ${invno} (${lines.length} lines, amount ${totalDebit.toFixed(2)})`,
+      module: 'Fee Control',
+      campus: '',
+      campusCode: ccode,
+      status: 'Success',
+      meta: { invno, totalDebit, totalCredit },
+    });
+
+    return this.loadFeeVoucher(username, invno);
+  }
+
+  async deleteVoucher(username: string, invnoRaw: string) {
+    const invno = String(invnoRaw || '').trim();
+    if (!invno) return { ok: false, message: 'Invoice required' };
+    if (!invno.toUpperCase().endsWith('F')) {
+      return { ok: false, message: 'Only fee receipts (…F) can be deleted here.' };
+    }
+
+    const existing = await this.loadFeeVoucher(username, invno);
+    if (!existing.ok || !existing.master) {
+      return { ok: false, message: existing.message || 'Voucher not found' };
+    }
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        await client.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
+        await client.query(`DELETE FROM accmast WHERE trim(invno) = $1`, [invno]);
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to delete voucher.';
+      return { ok: false, message };
+    }
+
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Fee Receipt Deleted',
+      description: `Deleted fee receipt ${invno}`,
+      module: 'Fee Control',
+      campus: '',
+      campusCode: existing.master.ccode || '',
+      status: 'Success',
+      meta: { invno },
+    });
+
+    return { ok: true, message: `Receipt ${invno} deleted.` };
+  }
+
+  private async loadFeeVoucher(username: string, invnoRaw: string) {
+    const invno = invnoRaw.trim();
+    if (!invno) return { ok: false, message: 'Invoice required', master: null, lines: [] };
+    const zone = await this.zonePrefix(username);
+    const master = await this.database.query<{
+      invno: string;
+      invdate: string;
+      nar: string;
+      ccode: string;
+      mont: string;
+      uname: string;
+    }>(
+      `SELECT trim(invno) AS invno,
+              left(trim(invdate), 10) AS invdate,
+              coalesce(trim(nar), '') AS nar,
+              coalesce(trim(ccode), '') AS ccode,
+              coalesce(trim(mont), '') AS mont,
+              coalesce(trim(uname), '') AS uname
+       FROM accmast
+       WHERE trim(invno) = $1
+       ORDER BY row_id
+       LIMIT 1`,
+      [invno],
+    );
+    const row = master.rows[0];
+    if (!row) return { ok: false, message: 'Voucher not found', master: null, lines: [] };
+    if (zone && row.ccode && !(row.ccode === zone || row.ccode.startsWith(zone))) {
+      return { ok: false, message: 'Voucher outside your zone', master: null, lines: [] };
+    }
+    const lines = await this.database.query<{
+      acode: string;
+      ahead: string;
+      debit: string;
+      credit: string;
+      snar: string;
+    }>(
+      `SELECT trim(d.acode) AS acode,
+              coalesce(trim(a.ahead), '') AS ahead,
+              (${this.debitSql})::text AS debit,
+              (${this.creditSql})::text AS credit,
+              coalesce(trim(d.snar), '') AS snar
+       FROM accdet d
+       LEFT JOIN acc a ON trim(a.acode) = trim(d.acode)
+       WHERE trim(d.invno) = $1
+       ORDER BY d.row_id`,
+      [invno],
+    );
+    return {
+      ok: true,
+      master: row,
+      lines: lines.rows.map((l) => ({
+        accountCode: l.acode,
+        accountName: l.ahead,
+        debit: round2(Number(l.debit) || 0),
+        credit: round2(Number(l.credit) || 0),
+        narration: l.snar,
+      })),
+    };
+  }
+
+  async logReport(
+    username: string,
+    report: string,
+    description: string,
+    campus = '',
+    campusCode = '',
+  ) {
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Report Generated',
+      description: description || report,
+      module: 'Financial Control',
+      campus,
+      campusCode,
+      status: 'Success',
+      meta: { report },
+    });
+  }
+
+  private parentCodes(code: string): string[] {
+    const parents: string[] = [];
+    // COA lengths: 1, 2, 4, 6, 10
+    const lens = [1, 2, 4, 6];
+    for (const len of lens) {
+      if (code.length > len) parents.push(code.slice(0, len));
+    }
+    return parents;
+  }
+
+  private nearestParent(code: string, map: Map<string, TbNode>): TbNode | null {
+    const lens = [6, 4, 2, 1];
+    for (const len of lens) {
+      if (code.length <= len) continue;
+      const p = map.get(code.slice(0, len));
+      if (p) return p;
+    }
+    return null;
+  }
+
+  private hasMatchingDescendant(
+    code: string,
+    balMap: Map<string, { debit: number; credit: number }>,
+    nameMap: Map<string, { name: string; flag: string }>,
+    search: string,
+  ) {
+    const s = search.toLowerCase();
+    for (const c of balMap.keys()) {
+      if (!c.startsWith(code) || c === code) continue;
+      const hay = `${c} ${nameMap.get(c)?.name || ''}`.toLowerCase();
+      if (hay.includes(s)) return true;
+    }
+    return false;
+  }
+
+  private filterTree(nodes: TbNode[], search: string): TbNode[] {
+    const s = search.toLowerCase();
+    const out: TbNode[] = [];
+    for (const n of nodes) {
+      const children = this.filterTree(n.children, search);
+      const self = `${n.code} ${n.name}`.toLowerCase().includes(s);
+      if (self || children.length) {
+        out.push({ ...n, children: self ? n.children : children });
+      }
+    }
+    return out;
+  }
+
+  private async siteScope(username: string, site: string) {
+    const zone = await this.zonePrefix(username);
+    let code = site.trim();
+    if (!code) code = zone || '';
+    if (zone && code && !(code === zone || code.startsWith(zone))) return zone;
+    return code;
+  }
+
+  private async zonePrefix(username: string) {
+    const name = username.trim();
+    if (!name) return '';
+    const user = await this.database.query<{ desi: string | null }>(
+      `SELECT desi FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
+      [name],
+    );
+    const desi = user.rows[0]?.desi?.trim() ?? '';
+    return desi.length >= 4 ? desi : '';
+  }
+
+  private normDate(value: string) {
+    const v = String(value || '').trim();
+    return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : '';
+  }
+
+  private today() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  private monthStart() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    return `${y}-${m}-01`;
+  }
+
+  private nextDay(ymd: string) {
+    const d = new Date(`${ymd}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+}
+
+function round2(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/** Accept MMYYYY (legacy mont) or YYYYMM → return YYYYMM for range compare. */
+function toYyyymm(raw: string) {
+  const v = String(raw || '')
+    .trim()
+    .replace(/\D/g, '');
+  if (v.length !== 6) return '';
+  const mmFirst = Number(v.slice(0, 2));
+  if (mmFirst >= 1 && mmFirst <= 12) return v.slice(2) + v.slice(0, 2);
+  const year = Number(v.slice(0, 4));
+  const mmLast = Number(v.slice(4, 6));
+  if (year >= 1990 && year <= 2100 && mmLast >= 1 && mmLast <= 12) return v;
+  return '';
+}
+
+function monthKeysToDateSpan(fromKey: string, toKey: string) {
+  const a = fromKey <= toKey ? fromKey : toKey;
+  const b = fromKey <= toKey ? toKey : fromKey;
+  const from = `${a.slice(0, 4)}-${a.slice(4, 6)}-01`;
+  const y = Number(b.slice(0, 4));
+  const m = Number(b.slice(4, 6));
+  const last = new Date(Date.UTC(y, m, 0));
+  const to = `${last.getUTCFullYear()}-${String(last.getUTCMonth() + 1).padStart(2, '0')}-${String(last.getUTCDate()).padStart(2, '0')}`;
+  const next = new Date(Date.UTC(y, m, 1));
+  const toExclusive = `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}-${String(next.getUTCDate()).padStart(2, '0')}`;
+  return { from, to, toExclusive };
+}

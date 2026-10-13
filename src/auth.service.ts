@@ -1,0 +1,122 @@
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ActivityLogService } from './activity-log.service';
+import { DatabaseService } from './database.service';
+
+type UserRow = {
+  tname: string;
+  cata: string | null;
+  desi: string | null;
+  passwd: string | null;
+};
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly database: DatabaseService,
+    private readonly activityLog: ActivityLogService,
+  ) {}
+
+  async login(username: string, password: string, ipAddress = '') {
+    const name = username.trim();
+    const secret = password.trim();
+    if (!name || !secret) {
+      throw new UnauthorizedException('Username and password are required');
+    }
+
+    const user = await this.database.query<UserRow>(
+      `SELECT tname, cata, desi, passwd
+       FROM puser
+       WHERE upper(trim(tname)) = upper($1)
+       LIMIT 1`,
+      [name],
+    );
+    const row = user.rows[0];
+    const stored = row?.passwd?.trim() ?? '';
+    if (!row || !stored || stored !== secret) {
+      await this.activityLog.write({
+        category: 'auth',
+        username: name || 'Unknown',
+        activity: 'Login',
+        description: 'Failed sign-in attempt',
+        module: 'Auth',
+        status: 'Failed',
+        ipAddress,
+      });
+      throw new UnauthorizedException('Wrong username or password');
+    }
+
+    const rights = await this.database.query<{ mncode: string }>(
+      `SELECT mncode FROM cruser WHERE upper(trim(crname)) = upper($1)`,
+      [row.tname],
+    );
+    const menus = [
+      ...new Set(
+        rights.rows
+          .map((item) => item.mncode?.trim())
+          .filter((code): code is string => Boolean(code)),
+      ),
+    ];
+    const loginName = row.tname.trim();
+    const desi = row.desi?.trim() ?? '';
+    const canEdit =
+      loginName === 'ESS_ADMN' ||
+      loginName === 'ESS' ||
+      menus.some((code) => code.toUpperCase().includes('MODIFY'));
+    const role = canEdit ? 'Admin' : 'User';
+    const zone = zoneName(desi);
+
+    await this.activityLog.write({
+      category: 'auth',
+      username: loginName,
+      role,
+      activity: 'Login',
+      description: `Signed in to The Educators ERP (${zone})`,
+      module: 'Auth',
+      campus: zone,
+      campusCode: desi,
+      status: 'Success',
+      ipAddress,
+    });
+
+    return {
+      username: loginName,
+      cata: row.cata?.trim() ?? null,
+      desi,
+      zone,
+      role,
+      canEdit,
+      menus,
+    };
+  }
+
+  async logout(
+    username: string,
+    role = '',
+    campus = '',
+    campusCode = '',
+    ipAddress = '',
+  ) {
+    const name = username.trim();
+    if (!name) return { ok: false, message: 'Username required' };
+    await this.activityLog.write({
+      category: 'auth',
+      username: name,
+      role,
+      activity: 'Logout',
+      description: 'Signed out of The Educators ERP',
+      module: 'Auth',
+      campus,
+      campusCode,
+      status: 'Success',
+      ipAddress,
+    });
+    return { ok: true };
+  }
+}
+
+function zoneName(desi: string) {
+  if (desi.startsWith('1403')) return 'Tariq Shabbir';
+  if (desi.startsWith('1402')) return 'Mumtazabad';
+  if (desi.startsWith('1401')) return 'Shah Rukn-e-Alam';
+  return 'All zones';
+}
