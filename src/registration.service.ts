@@ -39,15 +39,18 @@ export class RegistrationService {
     return code;
   }
 
-  async sites(username: string) {
+  async sites(username: string, site = '') {
     const zone = await this.zonePrefix(username);
+    let scope = String(site || '').trim();
+    if (!scope) scope = zone || '';
+    else if (zone && !(scope === zone || scope.startsWith(zone))) scope = zone;
     const rows = await this.database.query<{ code: string; name: string }>(
       `SELECT trim(a.acode) AS code, trim(a.ahead) AS name
        FROM acc a
        WHERE a.acode LIKE '14%'
          AND ($1 = '' OR a.acode = $1 OR a.acode LIKE $1 || '%')
        ORDER BY a.acode`,
-      [zone],
+      [scope],
     );
     return rows.rows;
   }
@@ -79,11 +82,10 @@ export class RegistrationService {
 
   async lookups(username: string, site = '') {
     const [sites, classes, sections] = await Promise.all([
-      this.sites(username),
+      this.sites(username, site),
       this.classes(),
       this.sections(),
     ]);
-    void site;
     return { sites, classes, sections };
   }
 

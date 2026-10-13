@@ -7,6 +7,7 @@ type UserRow = {
   cata: string | null;
   desi: string | null;
   passwd: string | null;
+  stat: string | null;
 };
 
 @Injectable()
@@ -23,8 +24,13 @@ export class AuthService {
       throw new UnauthorizedException('Username and password are required');
     }
 
+    await this.database.query(
+      `ALTER TABLE puser ADD COLUMN IF NOT EXISTS stat text`,
+    );
+
     const user = await this.database.query<UserRow>(
-      `SELECT tname, cata, desi, passwd
+      `SELECT tname, cata, desi, passwd,
+              coalesce(nullif(trim(stat), ''), 'Active') AS stat
        FROM puser
        WHERE upper(trim(tname)) = upper($1)
        LIMIT 1`,
@@ -43,6 +49,18 @@ export class AuthService {
         ipAddress,
       });
       throw new UnauthorizedException('Wrong username or password');
+    }
+    if (String(row.stat || '').trim().toLowerCase() === 'blocked') {
+      await this.activityLog.write({
+        category: 'auth',
+        username: name || 'Unknown',
+        activity: 'Login',
+        description: 'Blocked account sign-in attempt',
+        module: 'Auth',
+        status: 'Failed',
+        ipAddress,
+      });
+      throw new UnauthorizedException('Account is blocked. Contact administrator.');
     }
 
     const rights = await this.database.query<{ mncode: string }>(

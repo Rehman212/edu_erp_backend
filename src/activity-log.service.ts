@@ -98,7 +98,7 @@ export class ActivityLogService implements OnModuleInit {
   }) {
     await this.ensureTable();
     const page = Math.max(1, Number(opts.page) || 1);
-    const pageSize = Math.min(Math.max(Number(opts.pageSize) || 50, 1), 200);
+    const pageSize = Math.min(Math.max(Number(opts.pageSize) || 50, 1), 5000);
     const offset = (page - 1) * pageSize;
     const q = String(opts.q ?? '').trim();
     const user = String(opts.user ?? '').trim();
@@ -148,8 +148,34 @@ export class ActivityLogService implements OnModuleInit {
     }
 
     const whereSql = where.join(' AND ');
-    const count = await this.database.query<{ total: string }>(
-      `SELECT count(*)::text AS total FROM erp_audit_log WHERE ${whereSql}`,
+    const stats = await this.database.query<{
+      total: string;
+      logins: string;
+      logouts: string;
+      failed: string;
+      ok: string;
+      users: string;
+      modules: string;
+      today: string;
+    }>(
+      `SELECT
+         count(*)::text AS total,
+         count(*) FILTER (
+           WHERE lower(trim(activity)) = 'login' AND status = 'Success'
+         )::text AS logins,
+         count(*) FILTER (
+           WHERE lower(trim(activity)) = 'logout' AND status = 'Success'
+         )::text AS logouts,
+         count(*) FILTER (WHERE status = 'Failed')::text AS failed,
+         count(*) FILTER (WHERE status = 'Success')::text AS ok,
+         count(DISTINCT NULLIF(trim(username), ''))::text AS users,
+         count(DISTINCT NULLIF(trim(module), ''))::text AS modules,
+         count(*) FILTER (
+           WHERE (created_at AT TIME ZONE 'Asia/Karachi')::date
+             = (now() AT TIME ZONE 'Asia/Karachi')::date
+         )::text AS today
+       FROM erp_audit_log
+       WHERE ${whereSql}`,
       params,
     );
 
@@ -204,9 +230,19 @@ export class ActivityLogService implements OnModuleInit {
         dateKey: String(row.createdAt || '').slice(0, 10),
         today: isTodayPk(row.createdAt),
       })),
-      total: Number(count.rows[0]?.total ?? 0),
+      total: Number(stats.rows[0]?.total ?? 0),
       page,
       pageSize,
+      stats: {
+        total: Number(stats.rows[0]?.total ?? 0),
+        logins: Number(stats.rows[0]?.logins ?? 0),
+        logouts: Number(stats.rows[0]?.logouts ?? 0),
+        failed: Number(stats.rows[0]?.failed ?? 0),
+        ok: Number(stats.rows[0]?.ok ?? 0),
+        users: Number(stats.rows[0]?.users ?? 0),
+        modules: Number(stats.rows[0]?.modules ?? 0),
+        today: Number(stats.rows[0]?.today ?? 0),
+      },
     };
   }
 

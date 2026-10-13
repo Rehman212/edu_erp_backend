@@ -1,0 +1,626 @@
+import { Injectable } from '@nestjs/common';
+import { DatabaseService } from './database.service';
+
+const ZONE_LABEL: Record<string, string> = {
+  '1401': 'Shah Rukn-e-Alam (SRA)',
+  '1402': 'Mumtazabad (MTZ)',
+  '1403': 'Tariq Shabbir (TSC)',
+};
+
+@Injectable()
+export class UsersService {
+  private schemaReady: Promise<void> | null = null;
+
+  constructor(private readonly database: DatabaseService) {}
+
+  private ensureSchema() {
+    if (!this.schemaReady) {
+      this.schemaReady = (async () => {
+        await this.database.query(
+          `ALTER TABLE puser ADD COLUMN IF NOT EXISTS stat text`,
+        );
+        await this.database.query(
+          `ALTER TABLE puser
+             ADD COLUMN IF NOT EXISTS fname text,
+             ADD COLUMN IF NOT EXISTS lname text,
+             ADD COLUMN IF NOT EXISTS email text,
+             ADD COLUMN IF NOT EXISTS mobile1 text,
+             ADD COLUMN IF NOT EXISTS mobile2 text,
+             ADD COLUMN IF NOT EXISTS landline text,
+             ADD COLUMN IF NOT EXISTS address text,
+             ADD COLUMN IF NOT EXISTS city text,
+             ADD COLUMN IF NOT EXISTS gender text,
+             ADD COLUMN IF NOT EXISTS about text`,
+        );
+        await this.database.query(
+          `UPDATE puser
+           SET stat = 'Active'
+           WHERE coalesce(trim(stat), '') = ''`,
+        );
+      })().catch((err) => {
+        this.schemaReady = null;
+        throw err;
+      });
+    }
+    return this.schemaReady;
+  }
+
+  private cleanText(raw: unknown, max = 200) {
+    return String(raw ?? '')
+      .trim()
+      .slice(0, max);
+  }
+
+  private normalizeGender(raw: unknown) {
+    const g = String(raw ?? '')
+      .trim()
+      .toUpperCase();
+    if (!g) return '';
+    if (g === 'MALE' || g === 'M') return 'Male';
+    if (g === 'FEMALE' || g === 'F') return 'Female';
+    return '';
+  }
+
+  private async zonePrefix(username: string) {
+    const name = String(username || '').trim();
+    if (!name) return '';
+    const user = await this.database.query<{ desi: string | null }>(
+      `SELECT desi FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
+      [name],
+    );
+    const desi = user.rows[0]?.desi?.trim() ?? '';
+    return desi.length >= 4 ? desi : '';
+  }
+
+  private zoneLabel(desi: string) {
+    const d = String(desi || '').trim();
+    if (!d || d === '14') return 'All zones';
+    for (const code of ['1401', '1402', '1403'] as const) {
+      if (d === code || d.startsWith(code)) return ZONE_LABEL[code];
+    }
+    return d;
+  }
+
+  private roleOf(username: string, hasModify: boolean) {
+    const u = username.trim().toUpperCase();
+    if (u === 'ESS_ADMN' || u === 'ESS' || hasModify) return 'Admin';
+    return 'User';
+  }
+
+  private normalizeStatus(raw: unknown) {
+    const s = String(raw ?? '')
+      .trim()
+      .toLowerCase();
+    if (s === 'blocked' || s === 'block' || s === 'inactive') return 'Blocked';
+    return 'Active';
+  }
+
+  private mapRow(r: {
+    id: string;
+    username: string;
+    category: string;
+    desi: string;
+    campusName: string;
+    status: string;
+    menuCount: string;
+    hasModify: string;
+    fname?: string | null;
+    lname?: string | null;
+    email?: string | null;
+    mobile1?: string | null;
+    mobile2?: string | null;
+    landline?: string | null;
+    address?: string | null;
+    city?: string | null;
+    gender?: string | null;
+    about?: string | null;
+  }) {
+    const menuCount = Number(r.menuCount) || 0;
+    const hasModify = r.hasModify === '1';
+    const desi = r.desi || '';
+    const status = this.normalizeStatus(r.status);
+    const fname = (r.fname || '').trim();
+    const lname = (r.lname || '').trim();
+    const fullName = `${fname} ${lname}`.trim();
+    return {
+      id: r.id,
+      username: r.username,
+      fname,
+      lname,
+      fullName: fullName || r.username,
+      email: (r.email || '').trim(),
+      mobile1: (r.mobile1 || '').trim(),
+      mobile2: (r.mobile2 || '').trim(),
+      landline: (r.landline || '').trim(),
+      address: (r.address || '').trim(),
+      city: (r.city || '').trim(),
+      gender: this.normalizeGender(r.gender),
+      about: (r.about || '').trim(),
+      category: r.category || '—',
+      desi,
+      zone: this.zoneLabel(desi),
+      campus: r.campusName || this.zoneLabel(desi),
+      menuCount,
+      role: this.roleOf(r.username, hasModify),
+      status,
+    };
+  }
+
+  private profileFromBody(body: Record<string, string | undefined>) {
+    return {
+      fname: this.cleanText(body.fname ?? body.firstName, 80),
+      lname: this.cleanText(body.lname ?? body.lastName, 80),
+      email: this.cleanText(body.email, 120),
+      mobile1: this.cleanText(body.mobile1, 30),
+      mobile2: this.cleanText(body.mobile2, 30),
+      landline: this.cleanText(body.landline, 30),
+      address: this.cleanText(body.address, 250),
+      city: this.cleanText(body.city, 80),
+      gender: this.normalizeGender(body.gender),
+      about: this.cleanText(body.about ?? body.bio, 1000),
+    };
+  }
+
+  private listSelectSql() {
+    return `SELECT u.row_id::text AS id,
+              trim(u.tname) AS username,
+              coalesce(trim(u.cata), '') AS category,
+              coalesce(trim(u.desi), '') AS desi,
+              coalesce(nullif(trim(a.ahead), ''), '') AS "campusName",
+              coalesce(nullif(trim(u.stat), ''), 'Active') AS status,
+              coalesce(trim(u.fname), '') AS fname,
+              coalesce(trim(u.lname), '') AS lname,
+              coalesce(trim(u.email), '') AS email,
+              coalesce(trim(u.mobile1), '') AS mobile1,
+              coalesce(trim(u.mobile2), '') AS mobile2,
+              coalesce(trim(u.landline), '') AS landline,
+              coalesce(trim(u.address), '') AS address,
+              coalesce(trim(u.city), '') AS city,
+              coalesce(trim(u.gender), '') AS gender,
+              coalesce(trim(u.about), '') AS about,
+              (
+                SELECT count(*)::text
+                FROM cruser c
+                WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+              ) AS "menuCount",
+              (
+                SELECT CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM cruser c
+                    WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                      AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'
+                  ) THEN '1' ELSE '0'
+                END
+              ) AS "hasModify"
+       FROM puser u
+       LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')`;
+  }
+
+  async list(username: string, q = '', page = 1, pageSize = 50) {
+    await this.ensureSchema();
+    const scope = await this.zonePrefix(username);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+    const params: unknown[] = [];
+    const where: string[] = [`coalesce(trim(u.tname), '') <> ''`];
+
+    if (scope && scope.length > 2) {
+      params.push(scope);
+      where.push(
+        `(coalesce(trim(u.desi), '') = '' OR coalesce(trim(u.desi), '') = '14' OR coalesce(trim(u.desi), '') LIKE $${params.length} || '%')`,
+      );
+    }
+
+    if (q.trim()) {
+      params.push(`%${q.trim()}%`);
+      const i = params.length;
+      where.push(
+        `(u.tname ILIKE $${i}
+          OR coalesce(u.fname, '') ILIKE $${i}
+          OR coalesce(u.lname, '') ILIKE $${i}
+          OR coalesce(u.email, '') ILIKE $${i}
+          OR coalesce(u.city, '') ILIKE $${i}
+          OR coalesce(u.mobile1, '') ILIKE $${i}
+          OR coalesce(u.desi, '') ILIKE $${i}
+          OR coalesce(u.cata, '') ILIKE $${i}
+          OR coalesce(u.stat, '') ILIKE $${i})`,
+      );
+    }
+
+    const count = await this.database.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM puser u WHERE ${where.join(' AND ')}`,
+      params,
+    );
+
+    const limitIdx = params.length + 1;
+    const offsetIdx = params.length + 2;
+    const rows = await this.database.query<{
+      id: string;
+      username: string;
+      category: string;
+      desi: string;
+      campusName: string;
+      status: string;
+      menuCount: string;
+      hasModify: string;
+    }>(
+      `${this.listSelectSql()}
+       WHERE ${where.join(' AND ')}
+       ORDER BY upper(trim(u.tname))
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      [...params, size, offset],
+    );
+
+    const list = rows.rows.map((r) => this.mapRow(r));
+    const total = Number(count.rows[0]?.total) || 0;
+
+    const statsRows = await this.database.query<{
+      total: string;
+      admins: string;
+      withMenus: string;
+      active: string;
+      blocked: string;
+    }>(
+      `SELECT count(*)::text AS total,
+              count(*) FILTER (
+                WHERE upper(trim(u.tname)) IN ('ESS_ADMN', 'ESS')
+                   OR EXISTS (
+                     SELECT 1 FROM cruser c
+                     WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                       AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'
+                   )
+              )::text AS admins,
+              count(*) FILTER (
+                WHERE EXISTS (
+                  SELECT 1 FROM cruser c
+                  WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                )
+              )::text AS "withMenus",
+              count(*) FILTER (
+                WHERE upper(coalesce(nullif(trim(u.stat), ''), 'Active')) <> 'BLOCKED'
+              )::text AS active,
+              count(*) FILTER (
+                WHERE upper(coalesce(trim(u.stat), '')) = 'BLOCKED'
+              )::text AS blocked
+       FROM puser u
+       WHERE ${where.join(' AND ')}`,
+      params,
+    );
+    const s = statsRows.rows[0];
+
+    return {
+      rows: list,
+      total,
+      page: current,
+      pageSize: size,
+      stats: {
+        total: Number(s?.total) || total,
+        admins: Number(s?.admins) || 0,
+        withMenus: Number(s?.withMenus) || 0,
+        active: Number(s?.active) || 0,
+        blocked: Number(s?.blocked) || 0,
+      },
+    };
+  }
+
+  async create(actor: string, body: Record<string, string | undefined>) {
+    await this.ensureSchema();
+    const username = String(body.username || body.tname || '').trim();
+    const password = String(body.password || body.passwd || '').trim();
+    const desi = String(body.desi || body.scope || '14').trim() || '14';
+    const category = String(body.category || body.cata || '1').trim() || '1';
+    const status = this.normalizeStatus(body.status);
+    const profile = this.profileFromBody(body);
+
+    if (!username) return { ok: false, message: 'Username is required.' };
+    if (!password) return { ok: false, message: 'Password is required.' };
+    if (username.length > 40) return { ok: false, message: 'Username is too long.' };
+
+    const exists = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM puser WHERE upper(trim(tname)) = upper($1)`,
+      [username],
+    );
+    if (Number(exists.rows[0]?.n) > 0) {
+      return { ok: false, message: 'Username already exists.' };
+    }
+
+    await this.database.query(
+      `INSERT INTO puser (
+         tname, passwd, cata, desi, stat,
+         fname, lname, email, mobile1, mobile2, landline,
+         address, city, gender, about
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [
+        username,
+        password,
+        category,
+        desi,
+        status,
+        profile.fname,
+        profile.lname,
+        profile.email,
+        profile.mobile1,
+        profile.mobile2,
+        profile.landline,
+        profile.address,
+        profile.city,
+        profile.gender,
+        profile.about,
+      ],
+    );
+
+    const created = await this.database.query<{
+      id: string;
+      username: string;
+      category: string;
+      desi: string;
+      campusName: string;
+      status: string;
+      menuCount: string;
+      hasModify: string;
+    }>(
+      `${this.listSelectSql()}
+       WHERE upper(trim(u.tname)) = upper($1)
+       LIMIT 1`,
+      [username],
+    );
+
+    return {
+      ok: true,
+      message: 'User created.',
+      user: created.rows[0] ? this.mapRow(created.rows[0]) : null,
+      actor: actor.trim(),
+    };
+  }
+
+  async update(actor: string, idRaw: string, body: Record<string, string | undefined>) {
+    await this.ensureSchema();
+    const id = String(idRaw || '').trim();
+    if (!id) return { ok: false, message: 'User id required.' };
+
+    const current = await this.database.query<{
+      tname: string;
+      passwd: string | null;
+    }>(
+      `SELECT trim(tname) AS tname, passwd FROM puser WHERE row_id::text = $1 LIMIT 1`,
+      [id],
+    );
+    const row = current.rows[0];
+    if (!row?.tname) return { ok: false, message: 'User not found.' };
+
+    const nextName = String(body.username || body.tname || row.tname).trim();
+    if (!nextName) return { ok: false, message: 'Username is required.' };
+
+    if (nextName.toUpperCase() !== row.tname.toUpperCase()) {
+      const clash = await this.database.query<{ n: string }>(
+        `SELECT count(*)::text AS n
+         FROM puser
+         WHERE upper(trim(tname)) = upper($1)
+           AND row_id::text <> $2`,
+        [nextName, id],
+      );
+      if (Number(clash.rows[0]?.n) > 0) {
+        return { ok: false, message: 'Username already exists.' };
+      }
+    }
+
+    const password = String(body.password || body.passwd || '').trim();
+    const desi =
+      body.desi !== undefined || body.scope !== undefined
+        ? String(body.desi || body.scope || '14').trim() || '14'
+        : undefined;
+    const category =
+      body.category !== undefined || body.cata !== undefined
+        ? String(body.category || body.cata || '1').trim() || '1'
+        : undefined;
+    const status =
+      body.status !== undefined ? this.normalizeStatus(body.status) : undefined;
+    const profile = this.profileFromBody(body);
+
+    if (
+      status === 'Blocked' &&
+      actor.trim().toUpperCase() === row.tname.toUpperCase()
+    ) {
+      return { ok: false, message: 'You cannot block your own account.' };
+    }
+
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    const push = (sql: string, value: unknown) => {
+      params.push(value);
+      sets.push(`${sql} = $${params.length}`);
+    };
+
+    push('tname', nextName);
+    if (password) push('passwd', password);
+    if (desi !== undefined) push('desi', desi);
+    if (category !== undefined) push('cata', category);
+    if (status !== undefined) push('stat', status);
+    push('fname', profile.fname);
+    push('lname', profile.lname);
+    push('email', profile.email);
+    push('mobile1', profile.mobile1);
+    push('mobile2', profile.mobile2);
+    push('landline', profile.landline);
+    push('address', profile.address);
+    push('city', profile.city);
+    push('gender', profile.gender);
+    push('about', profile.about);
+
+    params.push(id);
+    await this.database.query(
+      `UPDATE puser SET ${sets.join(', ')} WHERE row_id::text = $${params.length}`,
+      params,
+    );
+
+    if (nextName.toUpperCase() !== row.tname.toUpperCase()) {
+      await this.database.query(
+        `UPDATE cruser SET crname = $1 WHERE upper(trim(crname)) = upper($2)`,
+        [nextName, row.tname],
+      );
+    }
+
+    const updated = await this.database.query<{
+      id: string;
+      username: string;
+      category: string;
+      desi: string;
+      campusName: string;
+      status: string;
+      menuCount: string;
+      hasModify: string;
+    }>(
+      `${this.listSelectSql()}
+       WHERE u.row_id::text = $1
+       LIMIT 1`,
+      [id],
+    );
+
+    return {
+      ok: true,
+      message: 'User updated.',
+      user: updated.rows[0] ? this.mapRow(updated.rows[0]) : null,
+    };
+  }
+
+  async setStatus(actor: string, idRaw: string, statusRaw: string) {
+    return this.update(actor, idRaw, { status: statusRaw });
+  }
+
+  async getMe(usernameRaw: string) {
+    await this.ensureSchema();
+    const username = String(usernameRaw || '').trim();
+    if (!username) return { ok: false, message: 'Not signed in.', user: null };
+    const rows = await this.database.query<{
+      id: string;
+      username: string;
+      category: string;
+      desi: string;
+      campusName: string;
+      status: string;
+      menuCount: string;
+      hasModify: string;
+      fname: string;
+      lname: string;
+      email: string;
+      mobile1: string;
+      mobile2: string;
+      landline: string;
+      address: string;
+      city: string;
+      gender: string;
+      about: string;
+    }>(
+      `${this.listSelectSql()}
+       WHERE upper(trim(u.tname)) = upper($1)
+       LIMIT 1`,
+      [username],
+    );
+    const row = rows.rows[0];
+    if (!row) return { ok: false, message: 'User not found.', user: null };
+    return { ok: true, user: this.mapRow(row) };
+  }
+
+  async updateMe(usernameRaw: string, body: Record<string, string | undefined>) {
+    await this.ensureSchema();
+    const username = String(usernameRaw || '').trim();
+    if (!username) return { ok: false, message: 'Not signed in.' };
+
+    const current = await this.database.query<{ id: string }>(
+      `SELECT row_id::text AS id FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
+      [username],
+    );
+    const id = current.rows[0]?.id;
+    if (!id) return { ok: false, message: 'User not found.' };
+
+    const profile = this.profileFromBody(body);
+    await this.database.query(
+      `UPDATE puser SET
+         fname = $1, lname = $2, email = $3,
+         mobile1 = $4, mobile2 = $5, landline = $6,
+         address = $7, city = $8, gender = $9, about = $10
+       WHERE row_id::text = $11`,
+      [
+        profile.fname,
+        profile.lname,
+        profile.email,
+        profile.mobile1,
+        profile.mobile2,
+        profile.landline,
+        profile.address,
+        profile.city,
+        profile.gender,
+        profile.about,
+        id,
+      ],
+    );
+
+    const me = await this.getMe(username);
+    return {
+      ok: true,
+      message: 'Profile saved.',
+      user: me.user,
+    };
+  }
+
+  async changePassword(
+    usernameRaw: string,
+    body: { currentPassword?: string; newPassword?: string },
+  ) {
+    await this.ensureSchema();
+    const username = String(usernameRaw || '').trim();
+    const currentPassword = String(body?.currentPassword || '').trim();
+    const newPassword = String(body?.newPassword || '').trim();
+    if (!username) return { ok: false, message: 'Not signed in.' };
+    if (!currentPassword) return { ok: false, message: 'Current password is required.' };
+    if (!newPassword) return { ok: false, message: 'New password is required.' };
+    if (newPassword.length < 4) {
+      return { ok: false, message: 'New password must be at least 4 characters.' };
+    }
+
+    const row = await this.database.query<{ passwd: string | null }>(
+      `SELECT passwd FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
+      [username],
+    );
+    if (!row.rows[0]) return { ok: false, message: 'User not found.' };
+    const stored = String(row.rows[0].passwd ?? '').trim();
+    if (stored !== currentPassword) {
+      return { ok: false, message: 'Current password is incorrect.' };
+    }
+
+    await this.database.query(
+      `UPDATE puser SET passwd = $1 WHERE upper(trim(tname)) = upper($2)`,
+      [newPassword, username],
+    );
+    return { ok: true, message: 'Password changed successfully.' };
+  }
+
+  async remove(actor: string, idRaw: string) {
+    await this.ensureSchema();
+    const id = String(idRaw || '').trim();
+    if (!id) return { ok: false, message: 'User id required.' };
+
+    const current = await this.database.query<{ tname: string }>(
+      `SELECT trim(tname) AS tname FROM puser WHERE row_id::text = $1 LIMIT 1`,
+      [id],
+    );
+    const name = current.rows[0]?.tname?.trim() || '';
+    if (!name) return { ok: false, message: 'User not found.' };
+
+    if (actor.trim().toUpperCase() === name.toUpperCase()) {
+      return { ok: false, message: 'You cannot delete your own account.' };
+    }
+    if (name.toUpperCase() === 'ESS_ADMN') {
+      return { ok: false, message: 'ESS_ADMN cannot be deleted.' };
+    }
+
+    await this.database.query(
+      `DELETE FROM cruser WHERE upper(trim(crname)) = upper($1)`,
+      [name],
+    );
+    await this.database.query(`DELETE FROM puser WHERE row_id::text = $1`, [id]);
+
+    return { ok: true, message: 'User deleted.' };
+  }
+}

@@ -19,7 +19,8 @@ import { RegistrationController } from './registration.controller';
 import { RegistrationService } from './registration.service';
 import { CampusSetupController } from './campus-setup.controller';
 import { CampusSetupService } from './campus-setup.service';
-
+import { UsersController } from './users.controller';
+import { UsersService } from './users.service';
 @Module({
   imports: [],
   controllers: [
@@ -32,6 +33,7 @@ import { CampusSetupService } from './campus-setup.service';
     PayrollController,
     RegistrationController,
     CampusSetupController,
+    UsersController,
     ActivityLogController,
   ],
   providers: [
@@ -45,6 +47,7 @@ import { CampusSetupService } from './campus-setup.service';
     PayrollService,
     RegistrationService,
     CampusSetupService,
+    UsersService,
   ],
 })
 export class AppModule {}
