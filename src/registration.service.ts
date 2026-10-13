@@ -12,6 +12,10 @@ function leftDate(v: unknown): string {
   return s.length >= 10 ? s.slice(0, 10) : s;
 }
 
+function isLeafCampus(code: string) {
+  return /^14(01|02|03)01\d{4}$/.test(String(code || '').trim());
+}
+
 @Injectable()
 export class RegistrationService {
   constructor(private readonly database: DatabaseService) {}
@@ -350,6 +354,9 @@ export class RegistrationService {
     const name = String(body.name || '').trim();
     const siteCode = String(body.siteCode || body.ccode || '').trim();
     if (!name) return { ok: false, message: 'Student name is required.' };
+    if (!isLeafCampus(siteCode)) {
+      return { ok: false, message: 'Select a campus, not a zone.' };
+    }
     if (!sdno) {
       const next = await this.nextStudentCode(username, siteCode);
       sdno = String(next.code || '').trim();
@@ -468,7 +475,11 @@ export class RegistrationService {
       set('sect', sec);
     }
     if (body.siteCode !== undefined || body.ccode !== undefined) {
-      set('ccode', String(body.siteCode || body.ccode || '').trim() || null);
+      const siteCode = String(body.siteCode || body.ccode || '').trim();
+      if (!isLeafCampus(siteCode)) {
+        return { ok: false, message: 'Select a campus, not a zone.' };
+      }
+      set('ccode', siteCode);
     }
     if (body.address !== undefined || body.paddress !== undefined) {
       set('paddress', String(body.address || body.paddress || '').trim() || null);
