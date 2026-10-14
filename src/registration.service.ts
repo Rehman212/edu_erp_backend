@@ -89,6 +89,58 @@ export class RegistrationService {
     return { sites, classes, sections };
   }
 
+  /**
+   * Student headcounts for zone / campus / class / section picker.
+   * Returns raw rows so the client can aggregate at each drill level.
+   */
+  async scopeCounts(username: string, site = '') {
+    const scope = await this.siteScope(username, site);
+    const params: unknown[] = [];
+    const where: string[] = [`coalesce(trim(st.name), '') <> ''`];
+    if (scope) {
+      params.push(`${scope}%`);
+      where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
+      if (/^14(01|02|03)$/.test(scope)) {
+        params.push(`${scope}%`);
+        where.push(`trim(st.sdno) LIKE $${params.length}`);
+      }
+    }
+    const rows = await this.database.query<{
+      campus: string;
+      class_code: string;
+      section_code: string;
+      n: string;
+    }>(
+      `SELECT coalesce(trim(st.ccode), '') AS campus,
+              coalesce(trim(st.class), '') AS class_code,
+              coalesce(nullif(trim(st.sec), ''), coalesce(trim(st.sect), '')) AS section_code,
+              count(*)::text AS n
+       FROM student st
+       WHERE ${where.join(' AND ')}
+       GROUP BY 1, 2, 3`,
+      params,
+    );
+    const byCampus: Record<string, number> = {};
+    const byClass: Record<string, number> = {};
+    const bySection: Record<string, number> = {};
+    let total = 0;
+    for (const r of rows.rows) {
+      const n = Number(r.n) || 0;
+      total += n;
+      if (r.campus) byCampus[r.campus] = (byCampus[r.campus] || 0) + n;
+      if (r.class_code) byClass[r.class_code] = (byClass[r.class_code] || 0) + n;
+      if (r.section_code) {
+        bySection[r.section_code] = (bySection[r.section_code] || 0) + n;
+      }
+    }
+    return { total, byCampus, byClass, bySection, rows: rows.rows.map((r) => ({
+      campus: r.campus,
+      classCode: r.class_code,
+      sectionCode: r.section_code,
+      count: Number(r.n) || 0,
+    })) };
+  }
+
   /** Distinct display values for the students table column dropdown filters. */
   async studentFilterOptions(username: string, site = '') {
     const scope = await this.siteScope(username, site);

@@ -28,6 +28,14 @@ export class RegistrationController {
     return this.registration.lookups(user ?? '', site ?? '');
   }
 
+  @Get('scope-counts')
+  scopeCounts(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('site') site?: string,
+  ) {
+    return this.registration.scopeCounts(user ?? '', site ?? '');
+  }
+
   @Get('students')
   students(
     @Headers('x-ess-user') user: string | undefined,
