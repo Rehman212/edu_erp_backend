@@ -10,12 +10,102 @@ function moneyNum(raw: unknown) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Upper bound for one report fetch; column-filtered reports load everything once. */
+const PAGE_MAX = 10000;
+
+type PayrollPage = {
+  rows: Record<string, unknown>[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalAmount?: number;
+};
+
+const PAYROLL_NUM_COLS = new Set([
+  'credit',
+  'amount',
+  'sick',
+  'casu',
+  'leaveDays',
+  'balance',
+  'basic',
+  'allowances',
+  'deductions',
+  'net',
+  'employees',
+  'present',
+  'absent',
+  'leave',
+  'shortLeave',
+]);
+const PAYROLL_EXACT_COLS = new Set(['zone', 'designation', 'type', 'status']);
+
+function payrollCell(row: Record<string, unknown>, key: string) {
+  if (key === 'zone') return row.siteCode ?? row.campus;
+  if (key === 'type') return row.empType;
+  if (key === 'balance') return row.leaveBalance ?? row.balance;
+  if (key === 'remark') return row.remark ?? row.remarks;
+  return row[key];
+}
+
+function matchPayrollCell(row: Record<string, unknown>, key: string, filter: string) {
+  const raw = payrollCell(row, key);
+  const text = String(raw ?? '').trim();
+  const needle = filter.trim().toLowerCase();
+  if (PAYROLL_NUM_COLS.has(key)) {
+    const want = Number(needle.replace(/,/g, ''));
+    if (Number.isFinite(want)) return Math.abs(moneyNum(raw) - want) < 0.005;
+    return text.toLowerCase().includes(needle);
+  }
+  if (PAYROLL_EXACT_COLS.has(key)) return text.toLowerCase() === needle;
+  if (key === 'month') {
+    const digits = needle.replace(/\D/g, '');
+    return digits ? text.replace(/\D/g, '').includes(digits) : true;
+  }
+  if (key === 'date' || key === 'joinDate' || key === 'leftDate') {
+    const d = text.slice(0, 10);
+    const dmy = d.length === 10 ? `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}` : '';
+    return d.toLowerCase().includes(needle) || dmy.includes(needle);
+  }
+  return text.toLowerCase().includes(needle);
+}
+
 @Injectable()
 export class PayrollService {
   private colCache = new Map<string, Set<string>>();
   private tableCache = new Map<string, boolean>();
 
   constructor(private readonly database: DatabaseService) {}
+
+  /**
+   * Column header filters for any payroll report: without filters the report pages itself;
+   * with filters the full report is loaded once, filtered, then paged here.
+   */
+  async withColumnFilters<T extends PayrollPage>(
+    colFilters: Record<string, string>,
+    page: number,
+    pageSize: number,
+    fetch: (page: number, pageSize: number) => Promise<T>,
+    amountOf: (rows: Record<string, unknown>[]) => number,
+  ): Promise<T> {
+    const active = Object.entries(colFilters).filter(([, v]) => String(v ?? '').trim());
+    if (!active.length) return fetch(page, pageSize);
+    const full = await fetch(1, PAGE_MAX);
+    const filtered = full.rows.filter((r) =>
+      active.every(([k, v]) => matchPayrollCell(r, k, String(v))),
+    );
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const offset = (current - 1) * size;
+    return {
+      ...full,
+      rows: filtered.slice(offset, offset + size),
+      total: filtered.length,
+      page: current,
+      pageSize: size,
+      totalAmount: round2(amountOf(filtered)),
+    };
+  }
 
   private async tableExists(name: string) {
     const key = name.toLowerCase();
@@ -384,7 +474,7 @@ export class PayrollService {
     const withPhoto = Boolean(filters.includePhoto && pc.photo);
 
     const page = Math.max(Number(filters.page) || 1, 1);
-    const pageSize = Math.min(Math.max(Number(filters.pageSize) || 50, 1), 200);
+    const pageSize = Math.min(Math.max(Number(filters.pageSize) || 50, 1), PAGE_MAX);
     const offset = (page - 1) * pageSize;
     const params: unknown[] = [];
     const where: string[] = [`coalesce(trim(p.${pc.code}), '') <> ''`];
@@ -639,7 +729,7 @@ export class PayrollService {
     const search = String(q || '').trim();
     let period = this.resolveMont(mont, fromDate);
     const scope = await this.siteScope(username, site);
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
 
@@ -972,7 +1062,7 @@ export class PayrollService {
         net: round2(r.net),
       }))
       .sort((a, b) => a.designation.localeCompare(b.designation));
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
     return {
@@ -1026,7 +1116,7 @@ export class PayrollService {
     const search = String(q || '').trim();
     let period = this.resolveMont(mont, fromDate);
     const scope = await this.siteScope(username, site);
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
 
@@ -1229,7 +1319,7 @@ export class PayrollService {
       const isLeft = left && (!from || left >= from) && (!to || left <= to);
       return Boolean(isNew || isLeft);
     });
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
     const rows = filtered.slice(offset, offset + size).map((r) => ({
@@ -1325,7 +1415,7 @@ export class PayrollService {
         net: round2(r.net),
       }))
       .sort((a, b) => a.siteCode.localeCompare(b.siteCode));
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
     return {

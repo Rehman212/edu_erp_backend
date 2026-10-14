@@ -38,7 +38,14 @@ export class RegistrationController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
+    const colFilters: Record<string, string> = {};
+    for (const [k, v] of Object.entries(all || {})) {
+      if (k.startsWith('f_') && typeof v === 'string' && v.trim()) {
+        colFilters[k.slice(2)] = v;
+      }
+    }
     return this.registration.listStudents(
       user ?? '',
       site ?? '',
@@ -48,7 +55,16 @@ export class RegistrationController {
       q ?? '',
       Number(page) || 1,
       Number(pageSize) || 50,
+      colFilters,
     );
+  }
+
+  @Get('students/filter-options')
+  filterOptions(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('site') site?: string,
+  ) {
+    return this.registration.studentFilterOptions(user ?? '', site ?? '');
   }
 
   @Get('students/next-code')

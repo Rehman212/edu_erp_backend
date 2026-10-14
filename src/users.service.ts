@@ -196,7 +196,126 @@ export class UsersService {
        LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')`;
   }
 
-  async list(username: string, q = '', page = 1, pageSize = 50) {
+  private zoneCondSql(value: string, params: unknown[]) {
+    const v = value.trim();
+    const desi = `coalesce(trim(u.desi), '')`;
+    if (v.toLowerCase() === 'all zones') return `(${desi} = '' OR ${desi} = '14')`;
+    const code = Object.entries(ZONE_LABEL).find(
+      ([, label]) => label.toLowerCase() === v.toLowerCase(),
+    )?.[0];
+    params.push(code ?? v);
+    return code ? `${desi} LIKE $${params.length} || '%'` : `upper(${desi}) = upper($${params.length})`;
+  }
+
+  private colFilterSql(colFilters: Record<string, string>, params: unknown[]) {
+    const where: string[] = [];
+    const like = (expr: string, v: string) => {
+      params.push(`%${v.trim()}%`);
+      return `${expr} ILIKE $${params.length}`;
+    };
+    const isAdmin = `(upper(trim(u.tname)) IN ('ESS_ADMN', 'ESS') OR EXISTS (
+        SELECT 1 FROM cruser c
+        WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+          AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'))`;
+    const isBlocked = `lower(coalesce(trim(u.stat), '')) IN ('blocked', 'block', 'inactive')`;
+
+    for (const [key, raw] of Object.entries(colFilters)) {
+      const v = String(raw ?? '').trim();
+      if (!v) continue;
+      switch (key) {
+        case 'username': {
+          params.push(`%${v}%`);
+          const i = params.length;
+          where.push(
+            `(u.tname ILIKE $${i} OR coalesce(u.fname, '') ILIKE $${i} OR coalesce(u.lname, '') ILIKE $${i}
+              OR (coalesce(trim(u.fname), '') || ' ' || coalesce(trim(u.lname), '')) ILIKE $${i}
+              OR coalesce(u.email, '') ILIKE $${i})`,
+          );
+          break;
+        }
+        case 'city':
+          where.push(like(`coalesce(u.city, '')`, v));
+          break;
+        case 'desi':
+          where.push(like(`coalesce(u.desi, '')`, v));
+          break;
+        case 'role':
+          if (v.toLowerCase() === 'admin') where.push(isAdmin);
+          else if (v.toLowerCase() === 'user') where.push(`NOT ${isAdmin}`);
+          break;
+        case 'status':
+          if (v.toLowerCase() === 'blocked') where.push(isBlocked);
+          else if (v.toLowerCase() === 'active') where.push(`NOT ${isBlocked}`);
+          break;
+        case 'zone':
+          where.push(this.zoneCondSql(v, params));
+          break;
+        case 'campus': {
+          params.push(v);
+          const i = params.length;
+          where.push(
+            `(upper(coalesce(trim(a.ahead), '')) = upper($${i})
+              OR (coalesce(trim(a.ahead), '') = '' AND ${this.zoneCondSql(v, params)}))`,
+          );
+          break;
+        }
+        case 'category':
+          params.push(v);
+          where.push(`upper(coalesce(trim(u.cata), '')) = upper($${params.length})`);
+          break;
+        case 'menuCount': {
+          const n = Number(v.replace(/,/g, ''));
+          if (!Number.isFinite(n)) break;
+          params.push(n);
+          where.push(
+            `(SELECT count(*) FROM cruser c WHERE upper(trim(c.crname)) = upper(trim(u.tname))) = $${params.length}`,
+          );
+          break;
+        }
+      }
+    }
+    return where;
+  }
+
+  async filterOptions(username: string) {
+    await this.ensureSchema();
+    const scope = await this.zonePrefix(username);
+    const params: unknown[] = [];
+    const where: string[] = [`coalesce(trim(u.tname), '') <> ''`];
+    if (scope && scope.length > 2) {
+      params.push(scope);
+      where.push(
+        `(coalesce(trim(u.desi), '') = '' OR coalesce(trim(u.desi), '') = '14' OR coalesce(trim(u.desi), '') LIKE $${params.length} || '%')`,
+      );
+    }
+    const res = await this.database.query<{ city: string; category: string; desi: string; campus: string }>(
+      `SELECT DISTINCT coalesce(trim(u.city), '') AS city,
+              coalesce(trim(u.cata), '') AS category,
+              coalesce(trim(u.desi), '') AS desi,
+              coalesce(trim(a.ahead), '') AS campus
+       FROM puser u
+       LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')
+       WHERE ${where.join(' AND ')}`,
+      params,
+    );
+    const uniq = (vals: string[]) =>
+      [...new Set(vals.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    const zones = uniq(res.rows.map((r) => this.zoneLabel(r.desi)));
+    return {
+      cities: uniq(res.rows.map((r) => r.city)),
+      categories: uniq(res.rows.map((r) => r.category)),
+      zones,
+      campuses: uniq(res.rows.map((r) => r.campus || this.zoneLabel(r.desi))),
+    };
+  }
+
+  async list(
+    username: string,
+    q = '',
+    page = 1,
+    pageSize = 50,
+    colFilters: Record<string, string> = {},
+  ) {
     await this.ensureSchema();
     const scope = await this.zonePrefix(username);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
@@ -228,8 +347,15 @@ export class UsersService {
       );
     }
 
+    const baseWhere = [...where];
+    const baseParams = [...params];
+    where.push(...this.colFilterSql(colFilters, params));
+
     const count = await this.database.query<{ total: string }>(
-      `SELECT count(*)::text AS total FROM puser u WHERE ${where.join(' AND ')}`,
+      `SELECT count(*)::text AS total
+       FROM puser u
+       LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')
+       WHERE ${where.join(' AND ')}`,
       params,
     );
 
@@ -284,8 +410,8 @@ export class UsersService {
                 WHERE upper(coalesce(trim(u.stat), '')) = 'BLOCKED'
               )::text AS blocked
        FROM puser u
-       WHERE ${where.join(' AND ')}`,
-      params,
+       WHERE ${baseWhere.join(' AND ')}`,
+      baseParams,
     );
     const s = statsRows.rows[0];
 

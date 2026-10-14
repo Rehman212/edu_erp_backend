@@ -1,6 +1,17 @@
 import { Body, Controller, Delete, Get, Headers, Param, Post, Put, Query } from '@nestjs/common';
 import { PayrollService } from './payroll.service';
 
+function colFiltersFrom(all?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(all || {})) {
+    if (k.startsWith('f_') && typeof v === 'string' && v.trim()) out[k.slice(2)] = v;
+  }
+  return out;
+}
+
+const sumOf = (key: string) => (rows: Record<string, unknown>[]) =>
+  rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
+
 @Controller('payroll')
 export class PayrollController {
   constructor(private readonly payroll: PayrollService) {}
@@ -42,15 +53,15 @@ export class PayrollController {
     @Query('toDate') toDate?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.employeeLedger(
-      user ?? '',
-      site ?? '',
-      employee ?? '',
-      fromDate ?? '',
-      toDate ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
+      (p, s) =>
+        this.payroll.employeeLedger(user ?? '', site ?? '', employee ?? '', fromDate ?? '', toDate ?? '', p, s),
+      sumOf('credit'),
     );
   }
 
@@ -63,15 +74,15 @@ export class PayrollController {
     @Query('designation') designation?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.employeeBonus(
-      user ?? '',
-      site ?? '',
-      employee ?? '',
-      empType ?? '',
-      designation ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
+      (p, s) =>
+        this.payroll.employeeBonus(user ?? '', site ?? '', employee ?? '', empType ?? '', designation ?? '', p, s),
+      sumOf('amount'),
     );
   }
 
@@ -85,16 +96,15 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.earnLeave(
-      user ?? '',
-      site ?? '',
-      employee ?? '',
-      empType ?? '',
-      designation ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      q ?? '',
+      (p, s) =>
+        this.payroll.earnLeave(user ?? '', site ?? '', employee ?? '', empType ?? '', designation ?? '', p, s, q ?? ''),
+      sumOf('leaveDays'),
     );
   }
 
@@ -112,20 +122,28 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.monthlySalarySheet(
-      user ?? '',
-      site ?? '',
-      mont ?? '',
-      empType ?? '',
-      designation ?? '',
-      paymentMode ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      fromDate ?? '',
-      toDate ?? '',
-      employee ?? '',
-      q ?? '',
+      (p, s) =>
+        this.payroll.monthlySalarySheet(
+          user ?? '',
+          site ?? '',
+          mont ?? '',
+          empType ?? '',
+          designation ?? '',
+          paymentMode ?? '',
+          p,
+          s,
+          fromDate ?? '',
+          toDate ?? '',
+          employee ?? '',
+          q ?? '',
+        ),
+      sumOf('net'),
     );
   }
 
@@ -142,19 +160,27 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.salarySummary(
-      user ?? '',
-      site ?? '',
-      mont ?? '',
-      empType ?? '',
-      designation ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      fromDate ?? '',
-      toDate ?? '',
-      employee ?? '',
-      q ?? '',
+      (p, s) =>
+        this.payroll.salarySummary(
+          user ?? '',
+          site ?? '',
+          mont ?? '',
+          empType ?? '',
+          designation ?? '',
+          p,
+          s,
+          fromDate ?? '',
+          toDate ?? '',
+          employee ?? '',
+          q ?? '',
+        ),
+      sumOf('net'),
     );
   }
 
@@ -171,19 +197,27 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.attendanceRegister(
-      user ?? '',
-      site ?? '',
-      mont ?? '',
-      empType ?? '',
-      designation ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      fromDate ?? '',
-      toDate ?? '',
-      employee ?? '',
-      q ?? '',
+      (p, s) =>
+        this.payroll.attendanceRegister(
+          user ?? '',
+          site ?? '',
+          mont ?? '',
+          empType ?? '',
+          designation ?? '',
+          p,
+          s,
+          fromDate ?? '',
+          toDate ?? '',
+          employee ?? '',
+          q ?? '',
+        ),
+      sumOf('present'),
     );
   }
 
@@ -196,15 +230,15 @@ export class PayrollController {
     @Query('empType') empType?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.missingNewcomers(
-      user ?? '',
-      site ?? '',
-      fromDate ?? '',
-      toDate ?? '',
-      empType ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
+      (p, s) =>
+        this.payroll.missingNewcomers(user ?? '', site ?? '', fromDate ?? '', toDate ?? '', empType ?? '', p, s),
+      (rows) => rows.length,
     );
   }
 
@@ -222,20 +256,28 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.monthlySalaryPack(
-      user ?? '',
-      site ?? '',
-      mont ?? '',
-      empType ?? '',
-      designation ?? '',
-      paymentMode ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      fromDate ?? '',
-      toDate ?? '',
-      employee ?? '',
-      q ?? '',
+      (p, s) =>
+        this.payroll.monthlySalaryPack(
+          user ?? '',
+          site ?? '',
+          mont ?? '',
+          empType ?? '',
+          designation ?? '',
+          paymentMode ?? '',
+          p,
+          s,
+          fromDate ?? '',
+          toDate ?? '',
+          employee ?? '',
+          q ?? '',
+        ),
+      sumOf('net'),
     );
   }
 
@@ -250,17 +292,25 @@ export class PayrollController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
-    return this.payroll.zonalSalarySummary(
-      user ?? '',
-      site ?? '',
-      mont ?? '',
+    return this.payroll.withColumnFilters(
+      colFiltersFrom(all),
       Number(page) || 1,
       Number(pageSize) || 50,
-      fromDate ?? '',
-      toDate ?? '',
-      employee ?? '',
-      q ?? '',
+      (p, s) =>
+        this.payroll.zonalSalarySummary(
+          user ?? '',
+          site ?? '',
+          mont ?? '',
+          p,
+          s,
+          fromDate ?? '',
+          toDate ?? '',
+          employee ?? '',
+          q ?? '',
+        ),
+      sumOf('net'),
     );
   }
 

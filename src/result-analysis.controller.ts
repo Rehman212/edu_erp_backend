@@ -39,7 +39,12 @@ export class ResultAnalysisController {
     @Query('sort') sort?: string,
     @Query('fromDate') fromDate?: string,
     @Query('toDate') toDate?: string,
+    @Query() all?: Record<string, string>,
   ) {
+    const colFilters: Record<string, string> = {};
+    for (const [k, v] of Object.entries(all || {})) {
+      if (k.startsWith('f_') && typeof v === 'string' && v.trim()) colFilters[k.slice(2)] = v;
+    }
     const siblingsOnly = ['1', 'true', 'yes'].includes(String(siblings ?? '').trim().toLowerCase());
     const employeeChildOnly = ['1', 'true', 'yes'].includes(
       String(employeeChild ?? '').trim().toLowerCase(),
@@ -58,7 +63,16 @@ export class ResultAnalysisController {
       sort?.trim() || 'desc',
       fromDate ?? '',
       toDate ?? '',
+      colFilters,
     );
+  }
+
+  @Get('students-filter-options')
+  studentFilterOptions(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('campus') campus?: string,
+  ) {
+    return this.resultAnalysis.studentFilterOptions(user ?? '', campus ?? '');
   }
 
   @Get('strength-classwise')

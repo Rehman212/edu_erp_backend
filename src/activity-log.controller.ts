@@ -10,6 +10,14 @@ function clientIp(req: Request) {
   return req.socket?.remoteAddress || '';
 }
 
+function colFiltersFrom(all?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(all || {})) {
+    if (k.startsWith('f_') && typeof v === 'string' && v.trim()) out[k.slice(2)] = v;
+  }
+  return out;
+}
+
 @Controller('activity-log')
 export class ActivityLogController {
   constructor(private readonly logs: ActivityLogService) {}
@@ -60,6 +68,7 @@ export class ActivityLogController {
     @Query('toDate') toDate?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.logs.list({
       category: 'activity',
@@ -72,6 +81,7 @@ export class ActivityLogController {
       toDate,
       page: Number(page) || 1,
       pageSize: Number(pageSize) || 50,
+      colFilters: colFiltersFrom(all),
     });
   }
 
@@ -91,6 +101,7 @@ export class ActivityLogController {
     @Query('toDate') toDate?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.logs.list({
       category: 'auth',
@@ -102,6 +113,7 @@ export class ActivityLogController {
       toDate,
       page: Number(page) || 1,
       pageSize: Number(pageSize) || 50,
+      colFilters: colFiltersFrom(all),
     });
   }
 

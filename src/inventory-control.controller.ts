@@ -1,6 +1,14 @@
 import { Body, Controller, Delete, Get, Headers, Post, Query } from '@nestjs/common';
 import { InventoryControlService, type StockReportMode } from './inventory-control.service';
 
+function colFiltersFrom(all?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(all || {})) {
+    if (k.startsWith('f_') && typeof v === 'string' && v.trim()) out[k.slice(2)] = v;
+  }
+  return out;
+}
+
 @Controller('inventory-control')
 export class InventoryControlController {
   constructor(private readonly inventory: InventoryControlService) {}
@@ -32,6 +40,7 @@ export class InventoryControlController {
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
     @Query('sort') sort?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.inventory.stockReport(
       user ?? '',
@@ -44,6 +53,32 @@ export class InventoryControlController {
       Number(page) || 1,
       Number(pageSize) || 50,
       sort?.trim() || 'desc',
+      colFiltersFrom(all),
+    );
+  }
+
+  /** Distinct Category / Location / Unit values for the stock table dropdown filters. */
+  @Get('stock/filter-options')
+  stockFilterOptions(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('site') site?: string,
+    @Query('category') category?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
+  ) {
+    return this.inventory.stockReport(
+      user ?? '',
+      site ?? '',
+      category ?? '',
+      '',
+      fromDate ?? '',
+      toDate ?? '',
+      'full',
+      1,
+      50,
+      'desc',
+      {},
+      true,
     );
   }
 
@@ -71,6 +106,17 @@ export class InventoryControlController {
     return this.inventory.nextInvoice(suffix ?? 'P');
   }
 
+  /** Distinct Department / Month values for the voucher table dropdown filters. */
+  @Get('vouchers/filter-options')
+  voucherFilterOptions(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('suffix') suffix?: string,
+    @Query('kind') kind?: string,
+    @Query('site') site?: string,
+  ) {
+    return this.inventory.listVouchers(user ?? '', suffix ?? '', 1, 50, kind ?? '', site ?? '', {}, true);
+  }
+
   /** Inventory Voucher list (purmast headers). */
   @Get('vouchers')
   vouchers(
@@ -80,6 +126,7 @@ export class InventoryControlController {
     @Query('site') site?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.inventory.listVouchers(
       user ?? '',
@@ -88,6 +135,7 @@ export class InventoryControlController {
       Number(pageSize) || 50,
       kind ?? '',
       site ?? '',
+      colFiltersFrom(all),
     );
   }
 

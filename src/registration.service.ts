@@ -89,6 +89,59 @@ export class RegistrationService {
     return { sites, classes, sections };
   }
 
+  /** Distinct display values for the students table column dropdown filters. */
+  async studentFilterOptions(username: string, site = '') {
+    const scope = await this.siteScope(username, site);
+    const params: unknown[] = [];
+    const where: string[] = [`coalesce(trim(st.name), '') <> ''`];
+    if (scope) {
+      params.push(`${scope}%`);
+      where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
+      if (/^14(01|02|03)$/.test(scope)) {
+        params.push(`${scope}%`);
+        where.push(`trim(st.sdno) LIKE $${params.length}`);
+      }
+    }
+    const rows = await this.database.query<{ kind: string; value: string }>(
+      `WITH s AS (
+         SELECT coalesce(nullif(trim(c.ahead), ''), trim(st.ccode)) AS campus,
+                coalesce(nullif(trim(cl.ahead), ''), trim(st.class)) AS class_name,
+                coalesce(nullif(trim(se.ahead), ''), nullif(trim(st.sec), ''), trim(st.sect)) AS section_name,
+                trim(st.atyp) AS adm_type
+         FROM student st
+         LEFT JOIN acc cl ON cl.acode = st.class
+         LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
+         LEFT JOIN acc c ON c.acode = st.ccode
+         WHERE ${where.join(' AND ')}
+       )
+       SELECT DISTINCT 'campus' AS kind, campus AS value FROM s WHERE coalesce(campus, '') <> ''
+       UNION SELECT DISTINCT 'className', class_name FROM s WHERE coalesce(class_name, '') <> ''
+       UNION SELECT DISTINCT 'sectionName', section_name FROM s WHERE coalesce(section_name, '') <> ''
+       UNION SELECT DISTINCT 'admissionType', adm_type FROM s WHERE coalesce(adm_type, '') <> ''`,
+      params,
+    );
+    const out: Record<string, string[]> = {
+      campus: [],
+      className: [],
+      sectionName: [],
+      admissionType: [],
+    };
+    const seen: Record<string, Set<string>> = {};
+    for (const r of rows.rows) {
+      const list = out[r.kind];
+      if (!list) continue;
+      const key = r.value.toUpperCase();
+      seen[r.kind] ??= new Set();
+      if (seen[r.kind].has(key)) continue;
+      seen[r.kind].add(key);
+      list.push(r.value);
+    }
+    for (const k of Object.keys(out)) {
+      out[k].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }
+    return out;
+  }
+
   async listStudents(
     username: string,
     site: string,
@@ -98,6 +151,7 @@ export class RegistrationService {
     q: string,
     page = 1,
     pageSize = 50,
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
@@ -128,8 +182,16 @@ export class RegistrationService {
       );
     }
     if (status.trim()) {
-      params.push(status.trim());
-      where.push(`upper(trim(coalesce(st.stat, ''))) = upper($${params.length})`);
+      const s = status.trim().toUpperCase();
+      // DB may store Transfered / Transferred / Transfer — match all.
+      if (s.startsWith('TRANSFER')) {
+        where.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%'`);
+      } else if (s.startsWith('PASSOUT')) {
+        where.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'PASSOUT%'`);
+      } else {
+        params.push(status.trim());
+        where.push(`upper(trim(coalesce(st.stat, ''))) = upper($${params.length})`);
+      }
     }
     if (q.trim()) {
       // AHMED / AHMAD (and spaced variants) are often the same father in ESS data.
@@ -152,6 +214,92 @@ export class RegistrationService {
       where.push(`(${qParts.join(' OR ')})`);
     }
 
+    const like = (expr: string, raw: string) => {
+      params.push(`%${raw.trim()}%`);
+      where.push(`coalesce(${expr}, '') ILIKE $${params.length}`);
+    };
+    const exact = (expr: string, raw: string) => {
+      params.push(raw.trim());
+      where.push(`upper(coalesce(${expr}, '')) = upper($${params.length})`);
+    };
+    const money = (col: string, raw: string) => {
+      params.push(`%${raw.replace(/,/g, '').trim()}%`);
+      where.push(
+        `replace(coalesce(trim(st.${col}::text), ''), ',', '') ILIKE $${params.length}`,
+      );
+    };
+    for (const [key, raw] of Object.entries(colFilters)) {
+      const v = String(raw || '').trim();
+      if (!v) continue;
+      switch (key) {
+        case 'name':
+          like('trim(st.name)', v);
+          break;
+        case 'sdno':
+          like('trim(st.sdno)', v);
+          break;
+        case 'fatherName':
+          like('trim(st.fname)', v);
+          break;
+        case 'campus':
+          exact(`coalesce(nullif(trim(c.ahead), ''), trim(st.ccode))`, v);
+          break;
+        case 'className':
+          exact(`coalesce(nullif(trim(cl.ahead), ''), trim(st.class))`, v);
+          break;
+        case 'sectionName':
+          exact(
+            `coalesce(nullif(trim(se.ahead), ''), nullif(trim(st.sec), ''), trim(st.sect))`,
+            v,
+          );
+          break;
+        case 'gender': {
+          const g = v.toUpperCase();
+          if (g.startsWith('M')) {
+            where.push(`upper(trim(coalesce(st.gndr, ''))) IN ('M', 'MALE')`);
+          } else if (g.startsWith('F')) {
+            where.push(`upper(trim(coalesce(st.gndr, ''))) IN ('F', 'FEMALE')`);
+          } else {
+            like('trim(st.gndr)', v);
+          }
+          break;
+        }
+        case 'admitDate':
+          params.push(`%${v}%`);
+          where.push(
+            `(coalesce(trim(st.adate), '') ILIKE $${params.length}
+              OR (trim(st.adate) ~ '^\\d{4}-\\d{2}-\\d{2}'
+                  AND to_char(left(trim(st.adate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
+          );
+          break;
+        case 'admissionType':
+          exact('trim(st.atyp)', v);
+          break;
+        case 'admissionFee':
+          money('adfee', v);
+          break;
+        case 'tuitionFee':
+          money('tfee', v);
+          break;
+        case 'transportFee':
+          money('transfee', v);
+          break;
+        case 'phone':
+          params.push(`%${v}%`);
+          where.push(
+            `(coalesce(trim(st.cellno), '') ILIKE $${params.length}
+              OR coalesce(trim(st.rphone), '') ILIKE $${params.length})`,
+          );
+          break;
+        default:
+          break;
+      }
+    }
+
+    const joins = `LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
+       LEFT JOIN acc c ON c.acode = st.ccode`;
+
     const count = await this.database.query<{
       total: string;
       active: string;
@@ -164,7 +312,9 @@ export class RegistrationService {
               count(*) FILTER (WHERE upper(trim(coalesce(st.stat, ''))) = 'LEFT')::text AS left,
               count(*) FILTER (WHERE upper(trim(coalesce(st.stat, ''))) LIKE 'PASSOUT%')::text AS passout,
               count(*) FILTER (WHERE upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%')::text AS transferred
-       FROM student st WHERE ${where.join(' AND ')}`,
+       FROM student st
+       ${joins}
+       WHERE ${where.join(' AND ')}`,
       params,
     );
 

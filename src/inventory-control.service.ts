@@ -117,9 +117,12 @@ export class InventoryControlService {
     page = 1,
     pageSize = 50,
     sort = 'desc',
+    colFilters: Record<string, string> = {},
+    optionsOnly = false,
   ) {
     const scope = await this.siteScope(username, site);
     if (!scope) {
+      if (optionsOnly) return { category: [], siteName: [], unit: [] };
       return {
         rows: [],
         total: 0,
@@ -168,7 +171,7 @@ export class InventoryControlService {
       modeFilter = `AND st.item_code LIKE '1%'`;
     }
 
-    const params = [
+    const params: unknown[] = [
       `${scope}%`,
       cat,
       search,
@@ -176,6 +179,70 @@ export class InventoryControlService {
       fromScope,
       toScope,
     ];
+
+    const catExpr = `coalesce(cg.name, left(st.item_code, 2))`;
+    const siteExpr = `coalesce(nullif(trim(a.ahead), ''), st.site_code)`;
+    const colWhere: string[] = [];
+    const like = (expr: string, raw: string) => {
+      params.push(`%${raw.trim()}%`);
+      colWhere.push(`coalesce(${expr}, '') ILIKE $${params.length}`);
+    };
+    const exact = (expr: string, raw: string) => {
+      params.push(raw.trim());
+      colWhere.push(`upper(coalesce(${expr}, '')) = upper($${params.length})`);
+    };
+    const num = (expr: string, raw: string) => {
+      params.push(`%${raw.replace(/,/g, '').trim()}%`);
+      colWhere.push(`(${expr})::text ILIKE $${params.length}`);
+    };
+    for (const [key, raw] of Object.entries(colFilters)) {
+      const v = String(raw || '').trim();
+      if (!v) continue;
+      switch (key) {
+        case 'itemName':
+          params.push(`%${v}%`);
+          colWhere.push(
+            `(coalesce(i.item_name, '') ILIKE $${params.length} OR st.item_code ILIKE $${params.length})`,
+          );
+          break;
+        case 'category':
+          exact(catExpr, v);
+          break;
+        case 'siteName':
+          exact(siteExpr, v);
+          break;
+        case 'qty':
+          num('round(st.qty, 2)', v);
+          break;
+        case 'unit':
+          exact(`coalesce(i.unit, '—')`, v);
+          break;
+        case 'unitRate':
+          num('CASE WHEN st.qty = 0 THEN 0 ELSE round(st.value / nullif(st.qty, 0), 2) END', v);
+          break;
+        case 'value':
+          num('round(st.value, 2)', v);
+          break;
+        case 'status': {
+          const s = v.toLowerCase();
+          if (s === 'zero') colWhere.push(`st.qty = 0`);
+          else if (s === 'short') colWhere.push(`st.qty < 0`);
+          else if (s === 'low') colWhere.push(`st.qty > 0 AND st.qty < 10`);
+          else if (s === 'in stock') colWhere.push(`st.qty >= 10`);
+          break;
+        }
+        case 'lastMove':
+          params.push(`%${v}%`);
+          colWhere.push(
+            `(coalesce(to_char(st.last_move, 'YYYY-MM-DD'), '') ILIKE $${params.length}
+              OR coalesce(to_char(st.last_move, 'DD Mon YYYY'), '') ILIKE $${params.length})`,
+          );
+          break;
+        default:
+          break;
+      }
+    }
+    const colFilterSql = colWhere.length ? `AND ${colWhere.join(' AND ')}` : '';
 
     const baseCte = `
       WITH purchases AS (
@@ -251,6 +318,15 @@ export class InventoryControlService {
         ORDER BY i.row_id
         LIMIT 1
       ) i ON true
+      LEFT JOIN LATERAL (
+        SELECT trim(g.itemname) AS name
+        FROM item g
+        WHERE coalesce(trim(g.uom), '') = ''
+          AND length(trim(g.itemcode)) BETWEEN 1 AND 4
+          AND st.item_code LIKE trim(g.itemcode) || '%'
+        ORDER BY length(trim(g.itemcode)) DESC
+        LIMIT 1
+      ) cg ON true
       LEFT JOIN acc a ON a.acode = st.site_code
       WHERE ($2 = '' OR st.item_code LIKE $2 || '%')
         AND (
@@ -260,7 +336,37 @@ export class InventoryControlService {
           OR coalesce(nullif(trim(a.ahead), ''), st.site_code) ILIKE $4
         )
         ${modeFilter}
+        ${colFilterSql}
     `;
+
+    if (optionsOnly) {
+      const opts = await this.database.query<{ kind: string; value: string }>(
+        `${baseCte}
+         , base AS (
+           SELECT ${catExpr} AS category, ${siteExpr} AS site_name, coalesce(i.unit, '—') AS unit
+           ${where}
+         )
+         SELECT DISTINCT 'category' AS kind, category AS value FROM base WHERE coalesce(category, '') <> ''
+         UNION SELECT DISTINCT 'siteName', site_name FROM base WHERE coalesce(site_name, '') <> ''
+         UNION SELECT DISTINCT 'unit', unit FROM base WHERE coalesce(unit, '') <> ''`,
+        params,
+      );
+      const out: Record<string, string[]> = { category: [], siteName: [], unit: [] };
+      const seen: Record<string, Set<string>> = {};
+      for (const r of opts.rows) {
+        const list = out[r.kind];
+        if (!list) continue;
+        const k = r.value.toUpperCase();
+        seen[r.kind] ??= new Set();
+        if (seen[r.kind].has(k)) continue;
+        seen[r.kind].add(k);
+        list.push(r.value);
+      }
+      for (const k of Object.keys(out)) {
+        out[k].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      }
+      return out;
+    }
 
     const stats = await this.database.query<{
       total: string;
@@ -292,18 +398,7 @@ export class InventoryControlService {
        SELECT st.item_code || ':' || st.site_code AS id,
               st.item_code AS "itemCode",
               coalesce(nullif(i.item_name, ''), st.item_code) AS "itemName",
-              coalesce(
-                (
-                  SELECT trim(g.itemname)
-                  FROM item g
-                  WHERE coalesce(trim(g.uom), '') = ''
-                    AND length(trim(g.itemcode)) BETWEEN 1 AND 4
-                    AND st.item_code LIKE trim(g.itemcode) || '%'
-                  ORDER BY length(trim(g.itemcode)) DESC
-                  LIMIT 1
-                ),
-                left(st.item_code, 2)
-              ) AS category,
+              ${catExpr} AS category,
               st.site_code AS "siteCode",
               coalesce(nullif(trim(a.ahead), ''), st.site_code) AS "siteName",
               st.qty::text AS qty,
@@ -316,7 +411,7 @@ export class InventoryControlService {
               END AS "unitRate"
        ${where}
        ${this.stockOrderBy(sortKey)}
-       LIMIT $7 OFFSET $8`,
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, size, offset],
     );
 
@@ -1148,6 +1243,58 @@ export class InventoryControlService {
     };
   }
 
+  /** Voucher list header filters → `AND …` SQL; pushes values onto params. */
+  private voucherColFilterSql(
+    params: unknown[],
+    colFilters: Record<string, string>,
+    columns: Record<string, { expr: string; type: 'like' | 'exact' | 'date' | 'money' }>,
+  ) {
+    const where: string[] = [];
+    for (const [key, raw] of Object.entries(colFilters)) {
+      const v = String(raw || '').trim();
+      const col = columns[key];
+      if (!v || !col) continue;
+      const e = `coalesce(${col.expr}, '')`;
+      if (col.type === 'exact') {
+        params.push(v);
+        where.push(`upper(${e}) = upper($${params.length})`);
+      } else if (col.type === 'date') {
+        params.push(`%${v}%`);
+        const n = params.length;
+        where.push(
+          `(left(${e}, 10) ILIKE $${n}
+            OR (substr(${e}, 9, 2) || '/' || substr(${e}, 6, 2) || '/' || substr(${e}, 1, 4)) ILIKE $${n})`,
+        );
+      } else if (col.type === 'money') {
+        params.push(`%${v.replace(/,/g, '')}%`);
+        const n = params.length;
+        where.push(
+          `(${e} ILIKE $${n}
+            OR (CASE WHEN ${e} ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN round(${e}::numeric, 2)::text ELSE '' END) ILIKE $${n})`,
+        );
+      } else {
+        params.push(`%${v}%`);
+        where.push(`${e} ILIKE $${params.length}`);
+      }
+    }
+    return where.length ? `AND ${where.join(' AND ')}` : '';
+  }
+
+  private dedupeOptions(rows: { kind: string; value: string }[], keys: string[]) {
+    const out: Record<string, string[]> = Object.fromEntries(keys.map((k) => [k, []]));
+    const seen: Record<string, Set<string>> = {};
+    for (const r of rows) {
+      const list = out[r.kind];
+      if (!list || !r.value) continue;
+      const k = r.value.toUpperCase();
+      seen[r.kind] ??= new Set();
+      if (seen[r.kind].has(k)) continue;
+      seen[r.kind].add(k);
+      list.push(r.value);
+    }
+    return out;
+  }
+
   /** H.F Student Voucher (…G) / H.C Collection (…F) from accmast. */
   private async listFeeVouchers(
     username: string,
@@ -1155,21 +1302,65 @@ export class InventoryControlService {
     page = 1,
     pageSize = 50,
     site = '',
+    colFilters: Record<string, string> = {},
+    optionsOnly = false,
   ) {
     const scope = await this.siteScope(username, site);
     if (String(site || '').trim() && !scope) {
+      if (optionsOnly) return { siteName: [], mont: [] };
       return { rows: [], total: 0, page, pageSize };
     }
     const scopeCode = (scope || '').replace(/%/g, '');
     const letter = kind === 'collectionVoucher' ? 'F' : 'G';
     const offset = (page - 1) * pageSize;
+    const siteExpr = `coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '')`;
+
+    if (optionsOnly) {
+      const opts = await this.database.query<{ kind: string; value: string }>(
+        `WITH base AS (
+           SELECT ${siteExpr} AS site_name, coalesce(trim(m.mont), '') AS mont
+           FROM accmast m
+           LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+           WHERE right(upper(trim(m.invno)), 1) = $2
+             AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+         )
+         SELECT kind, value FROM (
+           SELECT DISTINCT 'siteName' AS kind, site_name AS value, site_name AS ord FROM base WHERE site_name <> ''
+           UNION
+           SELECT DISTINCT 'mont', mont,
+             CASE WHEN mont ~ '^[0-9]{6}$' THEN right(mont, 4) || left(mont, 2) ELSE '' END
+           FROM base WHERE mont <> ''
+         ) o
+         ORDER BY kind, CASE WHEN kind = 'mont' THEN ord END DESC, ord`,
+        [scopeCode, letter],
+      );
+      return this.dedupeOptions(opts.rows, ['siteName', 'mont']);
+    }
+
+    const params: unknown[] = [scopeCode, letter];
+    const colFilterSql = this.voucherColFilterSql(params, colFilters, {
+      invno: { expr: 'trim(m.invno)', type: 'like' },
+      invdate: { expr: 'trim(m.invdate)', type: 'date' },
+      siteName: { expr: siteExpr, type: 'exact' },
+      sdno: { expr: `concat_ws(' ', trim(m.sdno), trim(st.name))`, type: 'like' },
+      mont: { expr: 'trim(m.mont)', type: 'exact' },
+      narp: { expr: 'trim(m.nar)', type: 'like' },
+    });
+    const fromSql = `FROM accmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+       LEFT JOIN student st ON trim(st.sdno) = trim(m.sdno)
+       WHERE right(upper(trim(m.invno)), 1) = $2
+         AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+         ${colFilterSql}`;
 
     const total = await this.database.query<{ n: string }>(
-      `SELECT count(*)::text AS n
-       FROM accmast m
-       WHERE right(upper(trim(m.invno)), 1) = $2
-         AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')`,
-      [scopeCode, letter],
+      colFilterSql
+        ? `SELECT count(*)::text AS n ${fromSql}`
+        : `SELECT count(*)::text AS n
+           FROM accmast m
+           WHERE right(upper(trim(m.invno)), 1) = $2
+             AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')`,
+      params,
     );
 
     const rows = await this.database.query<{
@@ -1217,15 +1408,11 @@ export class InventoryControlService {
               '' AS discount,
               coalesce(trim(m.pflag), '') AS pflag,
               right(upper(trim(m.invno)), 1) AS suffix,
-              $3 AS atag
-       FROM accmast m
-       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
-       LEFT JOIN student st ON trim(st.sdno) = trim(m.sdno)
-       WHERE right(upper(trim(m.invno)), 1) = $2
-         AND ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+              $${params.length + 1}::text AS atag
+       ${fromSql}
        ORDER BY m.row_id DESC
-       LIMIT $4 OFFSET $5`,
-      [scopeCode, letter, kind, pageSize, offset],
+       LIMIT $${params.length + 2} OFFSET $${params.length + 3}`,
+      [...params, kind, pageSize, offset],
     );
 
     return {
@@ -1247,16 +1434,19 @@ export class InventoryControlService {
     pageSize = 50,
     kindRaw = '',
     siteRaw = '',
+    colFilters: Record<string, string> = {},
+    optionsOnly = false,
   ) {
     const current = Math.max(1, Number(page) || 1);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
     const offset = (current - 1) * size;
     const kind = String(kindRaw || '').trim();
     if (kind === 'studentVoucher' || kind === 'collectionVoucher') {
-      return this.listFeeVouchers(username, kind, current, size, siteRaw);
+      return this.listFeeVouchers(username, kind, current, size, siteRaw, colFilters, optionsOnly);
     }
     const scope = await this.siteScope(username, siteRaw);
     if (String(siteRaw || '').trim() && !scope) {
+      if (optionsOnly) return { siteName: [], mont: [] };
       return { rows: [], total: 0, page: current, pageSize: size };
     }
     const suffix = String(suffixRaw || '')
@@ -1278,13 +1468,40 @@ export class InventoryControlService {
         OR ($3 = 'studentVoucher' AND coalesce(trim(m.atag), '') = 'studentVoucher')
         OR ($3 = 'collectionVoucher' AND coalesce(trim(m.atag), '') = 'collectionVoucher')
       )`;
+    const siteExpr = `coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '')`;
+
+    if (optionsOnly) {
+      const opts = await this.database.query<{ kind: string; value: string }>(
+        `SELECT DISTINCT 'siteName' AS kind, ${siteExpr} AS value
+         FROM purmast m
+         LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+         WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
+           ${typeWhere}
+         ORDER BY value`,
+        [scopeCode, letter, kind],
+      );
+      return this.dedupeOptions(opts.rows, ['siteName', 'mont']);
+    }
+
+    const params: unknown[] = [scopeCode, letter, kind];
+    const colFilterSql = this.voucherColFilterSql(params, colFilters, {
+      invno: { expr: 'trim(m.invno)', type: 'like' },
+      invdate: { expr: 'trim(m.invdate)', type: 'date' },
+      siteName: { expr: siteExpr, type: 'exact' },
+      pcode: { expr: 'trim(m.pcode)', type: 'like' },
+      dparty: { expr: 'trim(m.dparty)', type: 'like' },
+      narp: { expr: 'trim(m.narp)', type: 'like' },
+      discount: { expr: 'trim(m.discount)', type: 'money' },
+    });
 
     const total = await this.database.query<{ n: string }>(
       `SELECT count(*)::text AS n
        FROM purmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
        WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
-         ${typeWhere}`,
-      [scopeCode, letter, kind],
+         ${typeWhere}
+         ${colFilterSql}`,
+      params,
     );
 
     const rows = await this.database.query<{
@@ -1325,9 +1542,10 @@ export class InventoryControlService {
        LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
        WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
          ${typeWhere}
+         ${colFilterSql}
        ORDER BY m.row_id DESC
-       LIMIT $4 OFFSET $5`,
-      [scopeCode, letter, kind, size, offset],
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, size, offset],
     );
 
     return {

@@ -57,6 +57,7 @@ export class ResultAnalysisService {
     sort = 'desc',
     fromDate = '',
     toDate = '',
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.campusScope(username, campus);
     if (!scope) {
@@ -80,7 +81,7 @@ export class ResultAnalysisService {
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 500);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
-    const params = [
+    const params: unknown[] = [
       `${scope}%`,
       classScope ? `${classScope}%` : '',
       sectionScope ? `${sectionScope}%` : '',
@@ -91,6 +92,7 @@ export class ResultAnalysisService {
       toScope,
       zoneRoot ? `${zoneRoot}%` : '',
     ];
+    const colFilterSql = this.studentColFilterSql(colFilters, params);
 
     // Uses student.fnic_norm + indexes (stat, ccode) — avoids per-row regexp_replace.
     const siblingJoin = siblingsOnly
@@ -181,6 +183,7 @@ export class ResultAnalysisService {
           )
         )
         ${employeeChildClause}
+        ${colFilterSql}
     `;
 
     const stats = await this.database.query<{
@@ -197,6 +200,9 @@ export class ResultAnalysisService {
               count(*) FILTER (WHERE s.stat = 'Transfered')::text AS transferred
        FROM student s
        ${siblingJoin}
+       LEFT JOIN acc c ON c.acode = s.ccode
+       LEFT JOIN acc cl ON cl.acode = s.class
+       LEFT JOIN acc se ON se.acode = s.sec
        ${where}`,
       params,
     );
@@ -292,7 +298,7 @@ export class ResultAnalysisService {
        LEFT JOIN acc se ON se.acode = s.sec
        ${where}
        ${orderBy}
-       LIMIT $10 OFFSET $11`,
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, size, offset],
     );
 
@@ -334,6 +340,104 @@ export class ResultAnalysisService {
         other: Math.max(total - active - left - passout - transferred, 0),
       },
     };
+  }
+
+  /** Column header filters (`f_<accessor>`) for the students table; appends to `params`. */
+  private studentColFilterSql(colFilters: Record<string, string>, params: unknown[]) {
+    const out: string[] = [];
+    const like = (expr: string, raw: string) => {
+      params.push(`%${raw.trim()}%`);
+      out.push(`coalesce(${expr}, '') ILIKE $${params.length}`);
+    };
+    const exact = (expr: string, raw: string) => {
+      params.push(raw.trim());
+      out.push(`upper(coalesce(${expr}, '')) = upper($${params.length})`);
+    };
+    for (const [key, raw] of Object.entries(colFilters)) {
+      const v = String(raw || '').trim();
+      if (!v) continue;
+      switch (key) {
+        case 'name':
+          like('trim(s.name)', v);
+          break;
+        case 'sdno':
+          like('trim(s.sdno)', v);
+          break;
+        case 'rollNo':
+          like('trim(s.rollno)', v);
+          break;
+        case 'campus':
+          exact(`coalesce(nullif(trim(c.ahead), ''), trim(s.ccode))`, v);
+          break;
+        case 'className':
+          exact(`coalesce(nullif(trim(cl.ahead), ''), trim(s.class))`, v);
+          break;
+        case 'section':
+          exact(`coalesce(nullif(trim(se.ahead), ''), trim(s.sec))`, v);
+          break;
+        case 'admissionDate':
+          params.push(`%${v}%`);
+          out.push(
+            `(coalesce(trim(s.adate), '') ILIKE $${params.length}
+              OR (trim(s.adate) ~ '^\\d{4}-\\d{2}-\\d{2}'
+                  AND to_char(left(trim(s.adate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
+          );
+          break;
+        case 'status':
+          if (v.toUpperCase().startsWith('TRANSFER')) {
+            out.push(`upper(trim(coalesce(s.stat, ''))) LIKE 'TRANSFER%'`);
+          } else {
+            exact('trim(s.stat)', v);
+          }
+          break;
+        case 'contact':
+          like('trim(s.cellno)', v.replace(/^\+?92\s*/, ''));
+          break;
+        default:
+          break;
+      }
+    }
+    return out.length ? `AND ${out.join(' AND ')}` : '';
+  }
+
+  /** Distinct Campus / Class / Section values for the students table dropdown filters. */
+  async studentFilterOptions(username: string, campus = '') {
+    const scope = await this.campusScope(username, campus);
+    const empty = { campus: [] as string[], className: [] as string[], section: [] as string[] };
+    if (!scope) return empty;
+    const zoneRoot = /^(1401|1402|1403)$/.test(scope) ? scope : '';
+    const rows = await this.database.query<{ kind: string; value: string }>(
+      `WITH s AS (
+         SELECT coalesce(nullif(trim(c.ahead), ''), trim(st.ccode)) AS campus,
+                coalesce(nullif(trim(cl.ahead), ''), trim(st.class)) AS class_name,
+                coalesce(nullif(trim(se.ahead), ''), trim(st.sec)) AS section
+         FROM student st
+         LEFT JOIN acc c ON c.acode = st.ccode
+         LEFT JOIN acc cl ON cl.acode = st.class
+         LEFT JOIN acc se ON se.acode = st.sec
+         WHERE st.ccode LIKE $1
+           AND ($2 = '' OR trim(st.sdno) LIKE $2)
+       )
+       SELECT DISTINCT 'campus' AS kind, campus AS value FROM s WHERE coalesce(campus, '') <> ''
+       UNION SELECT DISTINCT 'className', class_name FROM s WHERE coalesce(class_name, '') <> ''
+       UNION SELECT DISTINCT 'section', section FROM s WHERE coalesce(section, '') <> ''`,
+      [`${scope}%`, zoneRoot ? `${zoneRoot}%` : ''],
+    );
+    const seen: Record<string, Set<string>> = {};
+    const out: Record<string, string[]> = { ...empty };
+    for (const r of rows.rows) {
+      const list = out[r.kind];
+      if (!list) continue;
+      const k = r.value.toUpperCase();
+      seen[r.kind] ??= new Set();
+      if (seen[r.kind].has(k)) continue;
+      seen[r.kind].add(k);
+      list.push(r.value);
+    }
+    for (const k of Object.keys(out)) {
+      out[k].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }
+    return out;
   }
 
   async strengthClasswise(

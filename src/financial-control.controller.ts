@@ -1,6 +1,14 @@
 import { Body, Controller, Delete, Get, Headers, Post, Query } from '@nestjs/common';
 import { FinancialControlService } from './financial-control.service';
 
+function colFiltersFrom(all?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(all || {})) {
+    if (k.startsWith('f_') && typeof v === 'string' && v.trim()) out[k.slice(2)] = v;
+  }
+  return out;
+}
+
 @Controller('financial-control')
 export class FinancialControlController {
   constructor(private readonly finance: FinancialControlService) {}
@@ -45,6 +53,7 @@ export class FinancialControlController {
     @Query('toDate') toDate?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.ledger(
       user ?? '',
@@ -54,6 +63,7 @@ export class FinancialControlController {
       toDate ?? '',
       Number(page) || 1,
       Number(pageSize) || 50,
+      colFiltersFrom(all),
     );
   }
 
@@ -66,6 +76,7 @@ export class FinancialControlController {
     @Query('account') account?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.cashBook(
       user ?? '',
@@ -75,6 +86,7 @@ export class FinancialControlController {
       account ?? '150601',
       Number(page) || 1,
       Number(pageSize) || 50,
+      colFiltersFrom(all),
     );
   }
 
@@ -171,6 +183,7 @@ export class FinancialControlController {
     @Query('status') status?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.feeCollection(
       user ?? '',
@@ -182,6 +195,7 @@ export class FinancialControlController {
       Number(page) || 1,
       Number(pageSize) || 50,
       status ?? 'ALL',
+      colFiltersFrom(all),
     );
   }
 
@@ -196,6 +210,7 @@ export class FinancialControlController {
     @Query('status') status?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.defaulters(
       user ?? '',
@@ -207,6 +222,7 @@ export class FinancialControlController {
       status ?? 'ALL',
       montFrom ?? '',
       montTo ?? '',
+      colFiltersFrom(all),
     );
   }
 
@@ -221,6 +237,7 @@ export class FinancialControlController {
     @Query('status') status?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.feeRegister(
       user ?? '',
@@ -232,6 +249,7 @@ export class FinancialControlController {
       status ?? 'ALL',
       montFrom ?? '',
       montTo ?? '',
+      colFiltersFrom(all),
     );
   }
 
@@ -269,6 +287,7 @@ export class FinancialControlController {
     @Query('status') status?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.defaultersToBanks(
       user ?? '',
@@ -280,6 +299,7 @@ export class FinancialControlController {
       status ?? 'ALL',
       montFrom ?? '',
       montTo ?? '',
+      colFiltersFrom(all),
     );
   }
 
@@ -294,6 +314,7 @@ export class FinancialControlController {
     @Query('acode') acode?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.finance.searchEntries(
       user ?? '',
@@ -305,6 +326,7 @@ export class FinancialControlController {
       acode ?? '',
       Number(page) || 1,
       Number(pageSize) || 50,
+      colFiltersFrom(all),
     );
   }
 

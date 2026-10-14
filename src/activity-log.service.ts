@@ -95,6 +95,7 @@ export class ActivityLogService implements OnModuleInit {
     toDate?: string;
     page?: number;
     pageSize?: number;
+    colFilters?: Record<string, string>;
   }) {
     await this.ensureTable();
     const page = Math.max(1, Number(opts.page) || 1);
@@ -145,6 +146,52 @@ export class ActivityLogService implements OnModuleInit {
       where.push(
         `(username ILIKE $${i} OR activity ILIKE $${i} OR description ILIKE $${i} OR module ILIKE $${i} OR campus ILIKE $${i} OR campus_code ILIKE $${i})`,
       );
+    }
+
+    const localTs = `(created_at AT TIME ZONE 'Asia/Karachi')`;
+    for (const [key, raw] of Object.entries(opts.colFilters ?? {})) {
+      const v = String(raw || '').trim();
+      if (!v) continue;
+      const exact = (expr: string) => {
+        params.push(v);
+        where.push(`upper(coalesce(${expr}, '')) = upper($${params.length})`);
+      };
+      const like = (expr: string) => {
+        params.push(`%${v}%`);
+        where.push(`coalesce(${expr}, '') ILIKE $${params.length}`);
+      };
+      switch (key) {
+        case 'user':
+          exact('trim(username)');
+          break;
+        case 'activity':
+          exact('trim(activity)');
+          break;
+        case 'module':
+          exact(`coalesce(nullif(trim(module), ''), '—')`);
+          break;
+        case 'campus':
+          exact(`coalesce(nullif(trim(campus), ''), '—')`);
+          break;
+        case 'status':
+          exact('status');
+          break;
+        case 'description':
+          like('description');
+          break;
+        case 'ipAddress':
+          like('ip_address');
+          break;
+        case 'time':
+          params.push(`%${v}%`);
+          where.push(
+            `(to_char(${localTs}, 'YYYY-MM-DD HH24:MI') ILIKE $${params.length}
+              OR to_char(${localTs}, 'DD Mon YYYY HH12:MI:SS AM') ILIKE $${params.length})`,
+          );
+          break;
+        default:
+          break;
+      }
     }
 
     const whereSql = where.join(' AND ');
@@ -269,10 +316,18 @@ export class ActivityLogService implements OnModuleInit {
        ORDER BY 1`,
       [category],
     );
+    const campuses = await this.database.query<{ name: string }>(
+      `SELECT DISTINCT trim(campus) AS name
+       FROM erp_audit_log
+       WHERE category = $1 AND trim(campus) <> ''
+       ORDER BY 1`,
+      [category],
+    );
     return {
       users: users.rows.map((r) => r.name),
       activities: activities.rows.map((r) => r.name),
       modules: modules.rows.map((r) => r.name),
+      campuses: campuses.rows.map((r) => r.name),
     };
   }
 }

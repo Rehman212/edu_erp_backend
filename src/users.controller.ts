@@ -11,6 +11,14 @@ import {
 } from '@nestjs/common';
 import { UsersService } from './users.service';
 
+function colFiltersFrom(all?: Record<string, string>) {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(all || {})) {
+    if (k.startsWith('f_') && typeof v === 'string' && v.trim()) out[k.slice(2)] = v;
+  }
+  return out;
+}
+
 @Controller('users')
 export class UsersController {
   constructor(private readonly users: UsersService) {}
@@ -21,13 +29,20 @@ export class UsersController {
     @Query('q') q?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Query() all?: Record<string, string>,
   ) {
     return this.users.list(
       user ?? '',
       q ?? '',
       Number(page) || 1,
       Number(pageSize) || 50,
+      colFiltersFrom(all),
     );
+  }
+
+  @Get('filter-options')
+  filterOptions(@Headers('x-ess-user') user?: string) {
+    return this.users.filterOptions(user ?? '');
   }
 
   @Get('me')

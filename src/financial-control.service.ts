@@ -16,6 +16,56 @@ export type TbNode = {
 const NUM = (alias: string, col: string) =>
   `CASE WHEN coalesce(${alias}.${col}, '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ${alias}.${col}::numeric ELSE 0 END`;
 
+/** Header filter columns over the fee voucher `base` CTE (Fee Collection / Fee Register). */
+const FEE_VOUCHER_COLS = {
+  date: { expr: 'b.invdate', type: 'date' },
+  invno: { expr: 'b.invno', type: 'like' },
+  mont: { expr: 'trim(b.mont)', type: 'exact' },
+  sdno: { expr: 'b.sdno', type: 'like' },
+  studentName: { expr: 'b."studentName"', type: 'like' },
+  siteName: { expr: 'b."siteName"', type: 'exact' },
+  narration: { expr: 'b.narr', type: 'like' },
+  amount: { expr: 'b.amount', type: 'num' },
+} as const;
+
+type DefaulterOut = {
+  sdno: string;
+  name: string;
+  status: string;
+  campus: string;
+  fromDate: string;
+  toDate: string;
+  fromMont: string;
+  toMont: string;
+  outstanding: number;
+  bankCode?: string;
+  bankName?: string;
+};
+
+const DEFAULTER_COLS = {
+  sdno: { get: (r: DefaulterOut) => r.sdno, type: 'like' },
+  name: { get: (r: DefaulterOut) => r.name, type: 'like' },
+  status: { get: (r: DefaulterOut) => r.status, type: 'exact' },
+  fromDate: { get: (r: DefaulterOut) => r.fromDate, type: 'date' },
+  toDate: { get: (r: DefaulterOut) => r.toDate, type: 'date' },
+  fromMont: {
+    get: (r: DefaulterOut) => [r.fromMont, r.toMont].filter(Boolean).join(' — '),
+    type: 'like',
+  },
+  campus: { get: (r: DefaulterOut) => r.campus, type: 'exact' },
+  outstanding: { get: (r: DefaulterOut) => r.outstanding, type: 'num' },
+  bankCode: { get: (r: DefaulterOut) => r.bankCode, type: 'like' },
+  bankName: { get: (r: DefaulterOut) => r.bankName, type: 'exact' },
+} as const;
+
+function defaulterOptions(rows: DefaulterOut[]) {
+  return {
+    campus: distinctSorted(rows.map((r) => r.campus)),
+    status: distinctSorted(rows.map((r) => r.status)),
+    bankName: distinctSorted(rows.map((r) => r.bankName)),
+  };
+}
+
 @Injectable()
 export class FinancialControlService {
   constructor(
@@ -216,6 +266,102 @@ export class FinancialControlService {
     };
   }
 
+  /**
+   * Ledger lines with header filters: running balance is computed over the whole period
+   * first, so a filtered line still shows its true balance.
+   */
+  private async filteredLedger(
+    account: { code: string; name: string; flag: string },
+    acodeSql: string,
+    baseParams: unknown[],
+    openBal: number,
+    colFilters: Record<string, string>,
+    current: number,
+    size: number,
+    meta: { site: string; fromDate: string; toDate: string },
+  ) {
+    const params: unknown[] = [...baseParams, openBal];
+    const baseSql = `SELECT d.invno AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(nullif(trim(d.snar), ''), nullif(trim(m.nar), ''), '') AS narr,
+              (${this.debitSql}) AS debit,
+              (${this.creditSql}) AS credit,
+              $5::numeric + sum(${this.debitSql} - ${this.creditSql})
+                OVER (ORDER BY m.invdate, d.row_id) AS balance,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(m.mont, '') AS mont,
+              m.invdate AS ord_date,
+              d.row_id AS ord_id
+       FROM accdet d
+       JOIN accmast m ON m.invno = d.invno
+       WHERE ${acodeSql}
+         AND m.invdate >= $2 AND m.invdate < $3
+         AND ($4 = '' OR m.ccode LIKE $4 || '%')`;
+    const colWhere = colFilterOutSql(
+      colFilters,
+      {
+        date: { expr: 'b.invdate', type: 'date' },
+        invno: { expr: 'b.invno', type: 'like' },
+        narration: { expr: 'b.narr', type: 'like' },
+        debit: { expr: 'b.debit', type: 'num' },
+        credit: { expr: 'b.credit', type: 'num' },
+        balance: { expr: 'b.balance', type: 'num' },
+      },
+      params,
+    );
+    const agg = await this.database.query<{ total: string; debit: string; credit: string }>(
+      `WITH base AS (${baseSql})
+       SELECT count(*)::text AS total,
+              coalesce(sum(b.debit), 0)::text AS debit,
+              coalesce(sum(b.credit), 0)::text AS credit
+       FROM base b ${colWhere}`,
+      params,
+    );
+    const lines = await this.database.query<{
+      invno: string;
+      invdate: string;
+      narr: string;
+      debit: string;
+      credit: string;
+      balance: string;
+      siteCode: string;
+      mont: string;
+    }>(
+      `WITH base AS (${baseSql})
+       SELECT b.invno, b.invdate, b.narr, b.debit::text AS debit, b.credit::text AS credit,
+              b.balance::text AS balance, b."siteCode", b.mont
+       FROM base b ${colWhere}
+       ORDER BY b.ord_date, b.ord_id
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, size, (current - 1) * size],
+    );
+    const pDebit = Number(agg.rows[0]?.debit) || 0;
+    const pCredit = Number(agg.rows[0]?.credit) || 0;
+    return {
+      account,
+      rows: lines.rows.map((row) => ({
+        invno: row.invno,
+        date: row.invdate,
+        narration: row.narr,
+        debit: round2(Number(row.debit) || 0),
+        credit: round2(Number(row.credit) || 0),
+        balance: round2(Number(row.balance) || 0),
+        siteCode: row.siteCode,
+        mont: row.mont,
+      })),
+      total: Number(agg.rows[0]?.total) || 0,
+      page: current,
+      pageSize: size,
+      opening: round2(openBal),
+      totals: {
+        debit: round2(pDebit),
+        credit: round2(pCredit),
+        balance: round2(openBal + pDebit - pCredit),
+      },
+      meta,
+    };
+  }
+
   async ledger(
     username: string,
     acodeRaw: string,
@@ -224,6 +370,7 @@ export class FinancialControlService {
     toDate: string,
     page = 1,
     pageSize = 50,
+    colFilters: Record<string, string> = {},
   ) {
     const acode = acodeRaw.trim();
     if (!acode) {
@@ -266,6 +413,19 @@ export class FinancialControlService {
       [acode, from, scope],
     );
     const openBal = Number(opening.rows[0]?.bal) || 0;
+
+    if (Object.values(colFilters).some((v) => String(v ?? '').trim())) {
+      return this.filteredLedger(
+        head.rows[0] || { code: acode, name: acode, flag: '' },
+        acodeSql,
+        [acode, from, toExclusive, scope],
+        openBal,
+        colFilters,
+        current,
+        size,
+        { site: scope, fromDate: from, toDate: to },
+      );
+    }
 
     const count = await this.database.query<{ total: string }>(
       `SELECT count(*)::text AS total
@@ -377,9 +537,10 @@ export class FinancialControlService {
     account = '150601',
     page = 1,
     pageSize = 50,
+    colFilters: Record<string, string> = {},
   ) {
     const code = account.trim() || '150601';
-    return this.ledger(username, code, site, fromDate, toDate, page, pageSize);
+    return this.ledger(username, code, site, fromDate, toDate, page, pageSize, colFilters);
   }
 
   async bankSummary(username: string, site: string, fromDate: string, toDate: string) {
@@ -746,6 +907,27 @@ export class FinancialControlService {
     };
   }
 
+  /** Distinct Campus / Month values for the fee voucher header dropdown filters. */
+  private async feeVoucherOptions(baseWhere: string, params: unknown[]) {
+    const res = await this.database.query<{ kind: string; value: string }>(
+      `SELECT DISTINCT 'siteName' AS kind, coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS value
+       FROM accmast m
+       LEFT JOIN acc s ON s.acode = m.ccode
+       WHERE ${baseWhere}
+       UNION
+       SELECT DISTINCT 'mont', trim(coalesce(m.mont, ''))
+       FROM accmast m
+       WHERE ${baseWhere}`,
+      params,
+    );
+    const pick = (kind: string) => res.rows.filter((r) => r.kind === kind).map((r) => r.value);
+    const monthKey = (m: string) => (m.length === 6 ? m.slice(2) + m.slice(0, 2) : m);
+    return {
+      siteName: distinctSorted(pick('siteName')),
+      mont: distinctSorted(pick('mont')).sort((a, b) => monthKey(b).localeCompare(monthKey(a))),
+    };
+  }
+
   async feeCollection(
     username: string,
     site: string,
@@ -756,6 +938,7 @@ export class FinancialControlService {
     page = 1,
     pageSize = 50,
     status = 'ALL',
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -787,38 +970,37 @@ export class FinancialControlService {
            WHERE st.sdno = m.sdno AND trim(st.stat) = $6
          )`
       : '';
-    const countParams: unknown[] = [from, toExclusive, scope, fromKey, toKey];
-    if (statusDb) countParams.push(statusDb);
+    const params: unknown[] = [from, toExclusive, scope, fromKey, toKey];
+    if (statusDb) params.push(statusDb);
+    const baseWhere = `right(m.invno, 1) = 'F'
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+         ${statusFilter}`;
+    const baseSql = `SELECT m.invno AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(m.nar, '') AS narr,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
+              coalesce(m.mont, '') AS mont,
+              coalesce(sum(${this.debitSql}), 0) AS amount
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       LEFT JOIN acc s ON s.acode = m.ccode
+       WHERE ${baseWhere}
+       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont`;
+
+    const options =
+      current === 1 ? await this.feeVoucherOptions(baseWhere, [...params]) : undefined;
+    const colWhere = colFilterOutSql(colFilters, FEE_VOUCHER_COLS, params);
 
     const count = await this.database.query<{ total: string; amount: string }>(
-      `SELECT count(*)::text AS total,
-              coalesce(sum(x.amt), 0)::text AS amount
-       FROM (
-         SELECT coalesce(sum(${this.debitSql}), 0) AS amt
-         FROM accmast m
-         JOIN accdet d ON d.invno = m.invno
-         WHERE right(m.invno, 1) = 'F'
-           AND m.invdate >= $1 AND m.invdate < $2
-           AND ($3 = '' OR m.ccode LIKE $3 || '%')
-           AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
-           AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-           ${statusFilter}
-         GROUP BY m.invno
-       ) x`,
-      countParams,
+      `WITH base AS (${baseSql})
+       SELECT count(*)::text AS total, coalesce(sum(b.amount), 0)::text AS amount
+       FROM base b ${colWhere}`,
+      params,
     );
-
-    const rowParams: unknown[] = [from, toExclusive, scope, fromKey, toKey];
-    const statusRowFilter = statusDb
-      ? `AND EXISTS (
-           SELECT 1 FROM student st
-           WHERE st.sdno = m.sdno AND trim(st.stat) = $6
-         )`
-      : '';
-    if (statusDb) rowParams.push(statusDb);
-    const limitIdx = rowParams.length + 1;
-    const offsetIdx = rowParams.length + 2;
-    rowParams.push(size, offset);
 
     const rows = await this.database.query<{
       invno: string;
@@ -829,29 +1011,16 @@ export class FinancialControlService {
       mont: string;
       amount: string;
     }>(
-      `SELECT m.invno AS invno,
-              left(m.invdate, 10) AS invdate,
-              coalesce(m.nar, '') AS narr,
-              coalesce(m.ccode, '') AS "siteCode",
-              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
-              coalesce(m.mont, '') AS mont,
-              coalesce(sum(${this.debitSql}), 0)::text AS amount
-       FROM accmast m
-       JOIN accdet d ON d.invno = m.invno
-       LEFT JOIN acc s ON s.acode = m.ccode
-       WHERE right(m.invno, 1) = 'F'
-         AND m.invdate >= $1 AND m.invdate < $2
-         AND ($3 = '' OR m.ccode LIKE $3 || '%')
-         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
-         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-         ${statusRowFilter}
-       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont
-       ORDER BY m.invdate DESC, m.invno DESC
-       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
-      rowParams,
+      `WITH base AS (${baseSql})
+       SELECT b.invno, b.invdate, b.narr, b."siteCode", b."siteName", b.mont, b.amount::text AS amount
+       FROM base b ${colWhere}
+       ORDER BY b.invdate DESC, b.invno DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, size, offset],
     );
 
     return {
+      options,
       rows: rows.rows.map((r) => ({
         invno: r.invno,
         date: r.invdate,
@@ -890,6 +1059,7 @@ export class FinancialControlService {
     status = 'ALL',
     montFrom = '',
     montTo = '',
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -997,12 +1167,14 @@ export class FinancialControlService {
         outstanding: round2(debit - credit),
       };
     });
-    const slice = mapped.slice(offset, offset + size);
-    const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
+    const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
+    const slice = filtered.slice(offset, offset + size);
+    const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
 
     return {
+      options: defaulterOptions(mapped),
       rows: slice,
-      total: mapped.length,
+      total: filtered.length,
       totalOutstanding: round2(totalOutstanding),
       page: current,
       pageSize: size,
@@ -1031,6 +1203,7 @@ export class FinancialControlService {
     status = 'ALL',
     montFrom = '',
     montTo = '',
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -1065,21 +1238,36 @@ export class FinancialControlService {
       )`;
     }
 
+    const baseWhere = `right(trim(m.invno), 1) = 'G'
+         AND m.invdate >= $1 AND m.invdate < $2
+         AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
+         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
+         ${statusFilter}`;
+    const baseSql = `SELECT trim(m.invno) AS invno,
+              left(m.invdate, 10) AS invdate,
+              coalesce(m.nar, '') AS narr,
+              coalesce(m.ccode, '') AS "siteCode",
+              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
+              coalesce(m.mont, '') AS mont,
+              coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), '') AS "studentName",
+              coalesce(sum(${this.debitSql}), 0) AS amount
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       LEFT JOIN acc s ON s.acode = m.ccode
+       LEFT JOIN student st ON st.sdno = m.sdno
+       WHERE ${baseWhere}
+       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont, m.sdno, st.name`;
+
+    const options =
+      current === 1 ? await this.feeVoucherOptions(baseWhere, [...params]) : undefined;
+    const colWhere = colFilterOutSql(colFilters, FEE_VOUCHER_COLS, params);
+
     const count = await this.database.query<{ total: string; amount: string }>(
-      `SELECT count(*)::text AS total,
-              coalesce(sum(x.amt), 0)::text AS amount
-       FROM (
-         SELECT coalesce(sum(${this.debitSql}), 0) AS amt
-         FROM accmast m
-         JOIN accdet d ON d.invno = m.invno
-         WHERE right(trim(m.invno), 1) = 'G'
-           AND m.invdate >= $1 AND m.invdate < $2
-           AND ($3 = '' OR m.ccode LIKE $3 || '%')
-           AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
-           AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-           ${statusFilter}
-         GROUP BY m.invno
-       ) x`,
+      `WITH base AS (${baseSql})
+       SELECT count(*)::text AS total, coalesce(sum(b.amount), 0)::text AS amount
+       FROM base b ${colWhere}`,
       params,
     );
 
@@ -1097,32 +1285,17 @@ export class FinancialControlService {
       studentName: string;
       amount: string;
     }>(
-      `SELECT trim(m.invno) AS invno,
-              left(m.invdate, 10) AS invdate,
-              coalesce(m.nar, '') AS narr,
-              coalesce(m.ccode, '') AS "siteCode",
-              coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
-              coalesce(m.mont, '') AS mont,
-              coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
-              coalesce(nullif(trim(st.name), ''), '') AS "studentName",
-              coalesce(sum(${this.debitSql}), 0)::text AS amount
-       FROM accmast m
-       JOIN accdet d ON d.invno = m.invno
-       LEFT JOIN acc s ON s.acode = m.ccode
-       LEFT JOIN student st ON st.sdno = m.sdno
-       WHERE right(trim(m.invno), 1) = 'G'
-         AND m.invdate >= $1 AND m.invdate < $2
-         AND ($3 = '' OR m.ccode LIKE $3 || '%')
-         AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
-         AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-         ${statusFilter}
-       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont, m.sdno, st.name
-       ORDER BY m.invdate DESC, m.invno DESC
+      `WITH base AS (${baseSql})
+       SELECT b.invno, b.invdate, b.narr, b."siteCode", b."siteName", b.mont, b.sdno,
+              b."studentName", b.amount::text AS amount
+       FROM base b ${colWhere}
+       ORDER BY b.invdate DESC, b.invno DESC
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
       rowParams,
     );
 
     return {
+      options,
       rows: rows.rows.map((r) => ({
         invno: r.invno,
         date: r.invdate || '',
@@ -1302,6 +1475,7 @@ export class FinancialControlService {
     status = 'ALL',
     montFrom = '',
     montTo = '',
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -1439,12 +1613,14 @@ export class FinancialControlService {
         outstanding: round2(debit - credit),
       };
     });
-    const slice = mapped.slice(offset, offset + size);
-    const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
+    const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
+    const slice = filtered.slice(offset, offset + size);
+    const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
 
     return {
+      options: defaulterOptions(mapped),
       rows: slice,
-      total: mapped.length,
+      total: filtered.length,
       totalOutstanding: round2(totalOutstanding),
       page: current,
       pageSize: size,
@@ -1469,6 +1645,7 @@ export class FinancialControlService {
     acode = '',
     page = 1,
     pageSize = 50,
+    colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
     const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
@@ -1500,6 +1677,23 @@ export class FinancialControlService {
       params.push(account);
       filters.push(`(d.acode = $${params.length} OR d.acode LIKE $${params.length} || '%')`);
     }
+    filters.push(
+      ...colFilterConds(
+        colFilters,
+        {
+          date: { expr: 'left(m.invdate, 10)', type: 'date' },
+          invno: { expr: 'd.invno', type: 'like' },
+          accountCode: { expr: `d.acode || ' ' || coalesce(a.ahead, '')`, type: 'like' },
+          narration: {
+            expr: `coalesce(nullif(trim(d.snar), ''), nullif(trim(m.nar), ''), '')`,
+            type: 'like',
+          },
+          debit: { expr: this.debitSql, type: 'num' },
+          credit: { expr: this.creditSql, type: 'num' },
+        },
+        params,
+      ),
+    );
     const where = filters.join(' AND ');
     params.push(size, offset);
 
@@ -1507,6 +1701,7 @@ export class FinancialControlService {
       `SELECT count(*)::text AS total
        FROM accdet d
        JOIN accmast m ON m.invno = d.invno
+       LEFT JOIN acc a ON a.acode = d.acode
        WHERE ${where}`,
       params.slice(0, params.length - 2),
     );
@@ -1920,6 +2115,96 @@ export class FinancialControlService {
 
 function round2(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+export type ColFilterType = 'like' | 'exact' | 'num' | 'date';
+
+/**
+ * WHERE clause over the output columns of a `base` CTE, for `f_<key>` header filters.
+ * `num` matches the 2-dp amount as text so "1500" finds 1500.00 and 21500.
+ */
+function colFilterOutSql(
+  colFilters: Record<string, string>,
+  spec: Record<string, { expr: string; type: ColFilterType }>,
+  params: unknown[],
+) {
+  const where = colFilterConds(colFilters, spec, params);
+  return where.length ? `WHERE ${where.join(' AND ')}` : '';
+}
+
+function colFilterConds(
+  colFilters: Record<string, string>,
+  spec: Record<string, { expr: string; type: ColFilterType }>,
+  params: unknown[],
+) {
+  const where: string[] = [];
+  for (const [key, raw] of Object.entries(colFilters)) {
+    const col = spec[key];
+    const v = String(raw ?? '').trim();
+    if (!col || !v) continue;
+    const e = `coalesce((${col.expr})::text, '')`;
+    if (col.type === 'exact') {
+      params.push(v);
+      where.push(`upper(trim(${e})) = upper($${params.length})`);
+    } else if (col.type === 'num') {
+      params.push(`%${v.replace(/,/g, '')}%`);
+      where.push(
+        `(CASE WHEN ${e} ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN round(${e}::numeric, 2)::text ELSE ${e} END) ILIKE $${params.length}`,
+      );
+    } else if (col.type === 'date') {
+      params.push(`%${v}%`);
+      const n = params.length;
+      where.push(
+        `(left(${e}, 10) ILIKE $${n}
+          OR (substr(${e}, 9, 2) || '/' || substr(${e}, 6, 2) || '/' || substr(${e}, 1, 4)) ILIKE $${n})`,
+      );
+    } else {
+      params.push(`%${v}%`);
+      where.push(`${e} ILIKE $${params.length}`);
+    }
+  }
+  return where;
+}
+
+/** Same matching rules as `colFilterOutSql`, for reports aggregated in memory. */
+function filterInMemory<T extends Record<string, unknown>>(
+  rows: T[],
+  colFilters: Record<string, string>,
+  spec: Record<string, { get: (r: T) => unknown; type: ColFilterType }>,
+) {
+  const active = Object.entries(colFilters)
+    .map(([k, v]) => [spec[k], String(v ?? '').trim()] as const)
+    .filter(([col, v]) => col && v);
+  if (!active.length) return rows;
+  return rows.filter((r) =>
+    active.every(([col, v]) => {
+      const raw = col!.get(r);
+      const text = String(raw ?? '').trim();
+      const needle = v.toLowerCase();
+      if (col!.type === 'exact') return text.toLowerCase() === needle;
+      if (col!.type === 'num') {
+        const n = Number(raw);
+        const shown = Number.isFinite(n) ? n.toFixed(2) : text;
+        return shown.includes(needle.replace(/,/g, ''));
+      }
+      if (col!.type === 'date') {
+        const d = text.slice(0, 10);
+        const dmy = d.length === 10 ? `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}` : '';
+        return d.toLowerCase().includes(needle) || dmy.includes(needle);
+      }
+      return text.toLowerCase().includes(needle);
+    }),
+  );
+}
+
+function distinctSorted(values: unknown[]) {
+  const seen = new Map<string, string>();
+  for (const raw of values) {
+    const v = String(raw ?? '').trim();
+    if (!v || v === '—') continue;
+    if (!seen.has(v.toUpperCase())) seen.set(v.toUpperCase(), v);
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
 }
 
 /** Accept MMYYYY (legacy mont) or YYYYMM → return YYYYMM for range compare. */
