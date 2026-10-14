@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 
 function moneyNum(v: unknown): number {
@@ -17,8 +17,14 @@ function isLeafCampus(code: string) {
 }
 
 @Injectable()
-export class RegistrationService {
+export class RegistrationService implements OnModuleInit {
   constructor(private readonly database: DatabaseService) {}
+
+  async onModuleInit() {
+    await this.database.query(
+      `ALTER TABLE student ADD COLUMN IF NOT EXISTS remarks text`,
+    );
+  }
 
   private async zonePrefix(username: string) {
     const name = String(username || '').trim();
@@ -90,13 +96,16 @@ export class RegistrationService {
   }
 
   /**
-   * Student headcounts for zone / campus / class / section picker.
+   * Active-student headcounts for zone / campus / class / section picker.
    * Returns raw rows so the client can aggregate at each drill level.
    */
   async scopeCounts(username: string, site = '') {
     const scope = await this.siteScope(username, site);
     const params: unknown[] = [];
-    const where: string[] = [`coalesce(trim(st.name), '') <> ''`];
+    const where: string[] = [
+      `coalesce(trim(st.name), '') <> ''`,
+      `upper(trim(coalesce(st.stat, ''))) = 'ACTIVE'`,
+    ];
     if (scope) {
       params.push(`${scope}%`);
       where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
@@ -293,6 +302,9 @@ export class RegistrationService {
         case 'fatherName':
           like('trim(st.fname)', v);
           break;
+        case 'remarks':
+          like('trim(st.remarks)', v);
+          break;
         case 'campus':
           exact(`coalesce(nullif(trim(c.ahead), ''), trim(st.ccode))`, v);
           break;
@@ -413,7 +425,8 @@ export class RegistrationService {
               coalesce(nullif(trim(st.regfee), ''), '0') AS "registrationFee",
               coalesce(nullif(trim(st.tfee), ''), '0') AS "tuitionFee",
               coalesce(nullif(trim(st.transfee), ''), '0') AS "transportFee",
-              coalesce(nullif(trim(st.anualfee), ''), '0') AS "annualFee"
+              coalesce(nullif(trim(st.anualfee), ''), '0') AS "annualFee",
+              coalesce(trim(st.remarks), '') AS remarks
        FROM student st
        LEFT JOIN acc cl ON cl.acode = st.class
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
@@ -488,7 +501,8 @@ export class RegistrationService {
               coalesce(trim(st.plevel), '') AS "previousLevel",
               coalesce(trim(st.lcerti), '') AS "leavingCert",
               coalesce(trim(st.pschool), '') AS "previousSchool",
-              coalesce(trim(st.photo), '') AS photo
+              coalesce(trim(st.photo), '') AS photo,
+              coalesce(trim(st.remarks), '') AS remarks
        FROM student st
        LEFT JOIN acc cl ON cl.acode = st.class
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
@@ -581,13 +595,13 @@ export class RegistrationService {
          bhcert, ftyr, class, sec, sect, ccode, paddress, cellno, rphone, ophone,
          gaurdian, relation, stat, atyp, adate, ldate, dpj,
          adfee, regfee, migfee, tfee, anualfee, transfee, sumpack, security,
-         plevel, lcerti, pschool, photo
+         plevel, lcerti, pschool, photo, remarks
        ) VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
          $12,$13,$14,$15,$15,$16,$17,$18,$19,$20,
          $21,$22,$23,$24,$25,$26,$27,
          $28,$29,$30,$31,$32,$33,$34,$35,
-         $36,$37,$38,$39
+         $36,$37,$38,$39,$40
        )`,
       [
         sdno,
@@ -629,6 +643,7 @@ export class RegistrationService {
         String(body.leavingCert || body.lcerti || '').trim() || null,
         String(body.previousSchool || body.pschool || '').trim() || null,
         String(body.photo || '').trim() || null,
+        String(body.remarks || '').trim() || null,
       ],
     );
     void username;
@@ -761,6 +776,7 @@ export class RegistrationService {
       set('pschool', String(body.previousSchool || body.pschool || '').trim() || null);
     }
     if (body.photo !== undefined) set('photo', String(body.photo || '').trim() || null);
+    if (body.remarks !== undefined) set('remarks', String(body.remarks || '').trim() || null);
 
     if (!sets.length) return { ok: false, message: 'Nothing to update.' };
     values.push(sdno);
