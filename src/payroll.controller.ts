@@ -314,6 +314,28 @@ export class PayrollController {
     );
   }
 
+  @Get('salary-generate')
+  salaryGenerateDraft(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('site') site?: string,
+    @Query('mont') mont?: string,
+  ) {
+    return this.payroll.salaryGenerateDraft(user ?? '', site ?? '', mont ?? '');
+  }
+
+  @Post('salary-generate')
+  salaryGeneratePost(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body()
+    body: {
+      mont?: string;
+      site?: string;
+      rows?: { code?: string; absent?: number; leave?: number; security?: number; transport?: number }[];
+    },
+  ) {
+    return this.payroll.salaryGeneratePost(user ?? '', body || {});
+  }
+
   @Get('next-employee-code')
   nextEmployeeCode(
     @Headers('x-ess-user') user: string | undefined,

@@ -30,6 +30,8 @@ const PAYROLL_NUM_COLS = new Set([
   'balance',
   'basic',
   'allowances',
+  'absentDays',
+  'absentCut',
   'deductions',
   'net',
   'employees',
@@ -848,6 +850,15 @@ export class PayrollService {
                  coalesce(nullif(trim(d.adva), ''), '0') AS adva,
                  coalesce(nullif(trim(d.itax), ''), '0') AS itax,
                  coalesce(nullif(trim(m.totmon), ''), '0') AS totmon,
+                 coalesce(nullif(trim(m.mbsal), ''), '0') AS full_basic,
+                 (coalesce(nullif(trim(m.mhrant), ''), '0')::numeric
+                  + coalesce(nullif(trim(m.mconv), ''), '0')::numeric
+                  + coalesce(nullif(trim(m.mutil), ''), '0')::numeric
+                  + coalesce(nullif(trim(m.motall), ''), '0')::numeric
+                  + coalesce(nullif(trim(m.mmess), ''), '0')::numeric)::text AS full_allow,
+                 coalesce(nullif(trim(d.abs), ''), '0') AS absent,
+                 trim(m.svno) AS svno,
+                 m.row_id AS vrow,
                  1 AS has_voucher
           FROM salarym m
           JOIN salaryd d ON trim(m.svno) = trim(d.svno)
@@ -871,6 +882,11 @@ export class PayrollService {
                  '0' AS adva,
                  '0' AS itax,
                  '0' AS totmon,
+                 ${pc.salary ? `coalesce(p.${pc.salary}::text, '0')` : `'0'`} AS full_basic,
+                 '0' AS full_allow,
+                 '0' AS absent,
+                 '' AS svno,
+                 0::bigint AS vrow,
                  0 AS has_voucher
           FROM persona p
           WHERE ${pWhere.join(' AND ')}`;
@@ -901,10 +917,15 @@ export class PayrollService {
           adva: string;
           itax: string;
           totmon: string;
+          full_basic: string;
+          full_allow: string;
+          absent: string;
+          svno: string;
           has_voucher: string;
         }>(
           `SELECT * FROM (${combined}) sheet
-           ORDER BY has_voucher ASC,
+           ORDER BY has_voucher DESC,
+                    vrow DESC,
                     length(regexp_replace(trim(code), '\\D', '', 'g')) DESC,
                     regexp_replace(trim(code), '\\D', '', 'g') DESC NULLS LAST,
                     name, code
@@ -913,20 +934,26 @@ export class PayrollService {
         );
 
         const mapped = rows.rows.map((r) => {
-          const basic = round2(moneyNum(r.basic));
-          const allowances = round2(
-            moneyNum(r.spall) + moneyNum(r.mess) + moneyNum(r.mna),
-          );
+          const posted = Number(r.has_voucher) === 1;
+          // salaryd.salary is already pro-rated for absents; mbsal + allowances is the full month.
+          const earned = round2(moneyNum(r.basic));
+          const extras = moneyNum(r.spall) + moneyNum(r.mess) + moneyNum(r.mna);
+          const basic = round2(moneyNum(r.full_basic) || earned);
+          const fullAllow = moneyNum(r.full_allow);
+          const allowances = round2(fullAllow + extras);
+          const absentCut = posted ? round2(Math.max(0, basic + fullAllow - earned)) : 0;
           const deductions = round2(
             Math.abs(moneyNum(r.loan)) +
               Math.abs(moneyNum(r.adva)) +
               Math.abs(moneyNum(r.itax)),
           );
-          const totmon = moneyNum(r.totmon);
-          const net = round2(
-            totmon !== 0 ? totmon : basic + allowances - deductions,
-          );
+          const net = round2(earned + extras - deductions);
           return {
+            absentDays: posted ? round2(moneyNum(r.absent)) : 0,
+            absentCut,
+            gross: round2(earned + extras),
+            security: round2(Math.abs(moneyNum(r.loan))),
+            transport: round2(Math.abs(moneyNum(r.itax))),
             code: r.code || '',
             name: r.name || r.code || '',
             designation: r.designation || '',
@@ -942,6 +969,8 @@ export class PayrollService {
             deductions,
             net,
             salary: basic,
+            status: Number(r.has_voucher) ? 'Posted' : 'Not posted',
+            voucherNo: r.svno || '',
           };
         });
 
@@ -1681,4 +1710,341 @@ export class PayrollService {
     void username;
     return { ok: true, message: `Employee ${code} deleted.`, code };
   }
+
+  private monthInfo(mont: string) {
+    const raw = String(mont || '').replace(/\D/g, '');
+    if (raw.length !== 6) return null;
+    const mm = Number(raw.slice(0, 2));
+    const yyyy = Number(raw.slice(2));
+    if (!mm || mm > 12 || yyyy < 2000) return null;
+    const days = new Date(yyyy, mm, 0).getDate();
+    const m2 = String(mm).padStart(2, '0');
+    return {
+      mont: `${m2}${yyyy}`,
+      days,
+      from: `${yyyy}-${m2}-01 00:00:00`,
+      to: `${yyyy}-${m2}-${String(days).padStart(2, '0')} 00:00:00`,
+    };
+  }
+
+  /** ESS posts support staff to 410104, everyone else to 410101, unless history says otherwise. */
+  private salaryExpenseCode(designation: string, lastCode: string) {
+    if (lastCode) return lastCode;
+    const support =
+      /guard|driver|aya|ayya|sweeper|gard[e]?n|electric|helper|office boy|peon|imam|shop|transport|welder|cook|mali|chowkidar|watchman|cleaner/i;
+    return support.test(designation) ? '410104' : '410101';
+  }
+
+  private salaryFigures(
+    p: SalaryBase,
+    days: number,
+    input: { absent?: unknown; leave?: unknown; security?: unknown; transport?: unknown },
+  ) {
+    const absent = Math.max(0, Math.round(moneyNum(input.absent)));
+    const leave = Math.max(0, Math.round(moneyNum(input.leave)));
+    const security = Math.max(0, Math.round(moneyNum(input.security)));
+    const transport = Math.max(0, Math.round(moneyNum(input.transport)));
+    const fixed =
+      p.basic + p.houseRent + p.conveyance + p.utility + p.mess + p.otherAllowance;
+    const worked = Math.min(Math.max(days - absent, 0), days);
+    const gross = Math.round((fixed * worked) / days);
+    const net = gross - security - transport;
+    return { absent, leave, security, transport, fixed, gross, net };
+  }
+
+  private async salaryBases(
+    scope: string,
+    mont: string,
+    codes: string[] | null,
+    run: (sql: string, params: unknown[]) => Promise<{ rows: Record<string, string>[] }>,
+  ): Promise<SalaryBase[]> {
+    const params: unknown[] = [mont, scope];
+    let codeFilter = '';
+    if (codes) {
+      params.push(codes);
+      codeFilter = `AND trim(p.ecode) = ANY($${params.length}::text[])`;
+    }
+    const res = await run(
+      `WITH last AS (
+         SELECT DISTINCT ON (trim(m.ecode))
+                trim(m.ecode) AS ecode,
+                coalesce(trim(m.excode), '') AS excode,
+                coalesce(nullif(trim(d.loan), ''), '0') AS loan,
+                coalesce(nullif(trim(d.itax), ''), '0') AS itax
+         FROM salarym m
+         JOIN salaryd d ON trim(d.svno) = trim(m.svno)
+         WHERE length(coalesce(trim(m.mont), '')) = 6
+         ORDER BY trim(m.ecode), right(trim(m.mont), 4) DESC, left(trim(m.mont), 2) DESC, m.row_id DESC
+       )
+       SELECT trim(p.ecode) AS code,
+              coalesce(trim(p.ename), '') AS name,
+              coalesce(trim(p.design), '') AS designation,
+              coalesce(trim(p.zcode), '') AS "siteCode",
+              coalesce(nullif(trim(a.ahead), ''), coalesce(trim(p.zcode), '')) AS campus,
+              coalesce(trim(p.regu), '') AS regu,
+              coalesce(p.bsalary, '0') AS basic,
+              coalesce(p.hrent, '0') AS "houseRent",
+              coalesce(p.convan, '0') AS conveyance,
+              coalesce(p.utility, '0') AS utility,
+              coalesce(p.mess, '0') AS mess,
+              coalesce(p.oall, '0') AS "otherAllowance",
+              coalesce(p.lrate, '0') AS lrate,
+              coalesce(trim(p.adcode), '') AS "payableCode",
+              coalesce(trim(p.lcode), '') AS "securityCode",
+              coalesce(trim(p.mscode), '') AS "transportCode",
+              coalesce(l.excode, '') AS "lastExpense",
+              l.loan AS "lastSecurity",
+              l.itax AS "lastTransport",
+              EXISTS (
+                SELECT 1 FROM salarym sm
+                WHERE trim(sm.ecode) = trim(p.ecode) AND trim(sm.mont) = $1
+              ) AS posted
+       FROM persona p
+       LEFT JOIN acc a ON trim(a.acode) = trim(p.zcode)
+       LEFT JOIN last l ON l.ecode = trim(p.ecode)
+       WHERE coalesce(trim(p.ecode), '') <> ''
+         AND upper(coalesce(nullif(trim(p.sta), ''), 'A')) = 'A'
+         AND ($2 = '' OR coalesce(trim(p.zcode), '') LIKE $2 || '%')
+         ${codeFilter}
+       ORDER BY campus, name`,
+      params,
+    );
+    return res.rows.map((r) => ({
+      code: r.code,
+      name: r.name || r.code,
+      designation: r.designation,
+      siteCode: r.siteCode,
+      campus: r.campus,
+      regu: r.regu,
+      basic: Math.round(moneyNum(r.basic)),
+      houseRent: Math.round(moneyNum(r.houseRent)),
+      conveyance: Math.round(moneyNum(r.conveyance)),
+      utility: Math.round(moneyNum(r.utility)),
+      mess: Math.round(moneyNum(r.mess)),
+      otherAllowance: Math.round(moneyNum(r.otherAllowance)),
+      payableCode: r.payableCode,
+      securityCode: r.securityCode,
+      transportCode: r.transportCode || '310201',
+      expenseCode: this.salaryExpenseCode(r.designation, r.lastExpense),
+      security: Math.round(
+        r.lastSecurity != null ? moneyNum(r.lastSecurity) : moneyNum(r.lrate),
+      ),
+      transport: Math.round(moneyNum(r.lastTransport)),
+      posted: String(r.posted) === 'true',
+    }));
+  }
+
+  private salaryBlockReason(p: SalaryBase, fig: { security: number; net: number }) {
+    if (p.posted) return 'Salary already posted for this month.';
+    if (!p.payableCode) return 'Salary payable account missing in employee profile.';
+    if (p.basic <= 0) return 'Basic salary is 0 in employee profile.';
+    if (fig.security > 0 && !p.securityCode) return 'Security account missing in employee profile.';
+    if (fig.net < 0) return 'Deductions are more than salary.';
+    return '';
+  }
+
+  async salaryGenerateDraft(username: string, site: string, mont: string) {
+    const info = this.monthInfo(mont);
+    if (!info) return { ok: false, message: 'Select a valid month.', rows: [] };
+    const scope = await this.siteScope(username, site);
+    const bases = await this.salaryBases(scope, info.mont, null, (sql, p) =>
+      this.database.query<Record<string, string>>(sql, p),
+    );
+    const pending = bases.filter((b) => !b.posted);
+    const rows = pending.map((b) => {
+      const fig = this.salaryFigures(b, info.days, b);
+      const reason = this.salaryBlockReason(b, fig);
+      return {
+        code: b.code,
+        name: b.name,
+        designation: b.designation,
+        siteCode: b.siteCode,
+        campus: b.campus,
+        empType: this.reguLabel(b.regu),
+        basic: b.basic,
+        allowances: fig.fixed - b.basic,
+        fixed: fig.fixed,
+        security: fig.security,
+        transport: fig.transport,
+        gross: fig.gross,
+        net: fig.net,
+        canPost: !reason,
+        reason,
+      };
+    });
+    return {
+      ok: true,
+      mont: info.mont,
+      days: info.days,
+      postedCount: bases.length - pending.length,
+      rows,
+    };
+  }
+
+  async salaryGeneratePost(
+    username: string,
+    body: {
+      mont?: string;
+      site?: string;
+      rows?: { code?: string; absent?: unknown; leave?: unknown; security?: unknown; transport?: unknown }[];
+    },
+  ) {
+    const info = this.monthInfo(String(body.mont || ''));
+    if (!info) return { ok: false, message: 'Select a valid month.' };
+    const input = (Array.isArray(body.rows) ? body.rows : [])
+      .map((r) => ({ ...r, code: String(r.code || '').trim() }))
+      .filter((r) => r.code);
+    if (!input.length) return { ok: false, message: 'Select at least one employee.' };
+    if (input.length > 1000) return { ok: false, message: 'Too many employees in one save.' };
+    const scope = await this.siteScope(username, String(body.site || ''));
+    const user = String(username || '').trim() || 'ERP';
+
+    return this.database.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('payroll_salary_post'))`);
+      const bases = await this.salaryBases(
+        scope,
+        info.mont,
+        input.map((r) => r.code),
+        (sql, p) => client.query<Record<string, string>>(sql, p),
+      );
+      const byCode = new Map(bases.map((b) => [b.code, b]));
+
+      const seq = await client.query<{ n: string }>(
+        `SELECT greatest(
+           (SELECT coalesce(max(substring(trim(svno) from '^([0-9]+)Y$')::bigint), 0)
+              FROM salarym WHERE trim(svno) ~ '^[0-9]+Y$'),
+           (SELECT coalesce(max(substring(trim(invno) from '^([0-9]+)Y1$')::bigint), 0)
+              FROM accmast WHERE trim(invno) ~ '^[0-9]+Y1$')
+         )::text AS n`,
+      );
+      let next = Number(seq.rows[0]?.n) || 0;
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const edate = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+      const created: { code: string; name: string; svno: string; jvno: string; net: number }[] = [];
+      const skipped: { code: string; reason: string }[] = [];
+
+      for (const row of input) {
+        const p = byCode.get(row.code);
+        if (!p) {
+          skipped.push({ code: row.code, reason: 'Employee not active or outside your zone.' });
+          continue;
+        }
+        const fig = this.salaryFigures(p, info.days, row);
+        if (fig.absent > info.days) {
+          skipped.push({ code: row.code, reason: `Absent days more than ${info.days}.` });
+          continue;
+        }
+        const reason = this.salaryBlockReason(p, fig);
+        if (reason) {
+          skipped.push({ code: row.code, reason });
+          continue;
+        }
+
+        next += 1;
+        const svno = `${String(next).padStart(6, '0')}Y`;
+        const jvno = `${next}Y1`;
+
+        await client.query(
+          `INSERT INTO salarym (
+             svno, ecode, mont, mbsal, mhrant, mconv, mutil, motall, mmess, mspal, totmon,
+             excode, pacode, locode, est, mscode, pflag, zcode
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'0',$10,$11,$12,$13,$14,$15,'O',$16)`,
+          [
+            svno,
+            p.code,
+            info.mont,
+            String(p.basic),
+            String(p.houseRent),
+            String(p.conveyance),
+            String(p.utility),
+            String(p.otherAllowance),
+            String(p.mess),
+            String(info.days),
+            p.expenseCode,
+            p.payableCode,
+            p.securityCode || null,
+            p.regu || null,
+            p.transportCode,
+            p.siteCode,
+          ],
+        );
+        await client.query(
+          `INSERT INTO salaryd (
+             svno, fdate, tdate, totday, abs, leav, salary, spall, loan, adva, itax, stcode, ebo, jvno
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'0',$8,'0',$9,$10,'0',$11)`,
+          [
+            svno,
+            info.from,
+            info.to,
+            String(info.days),
+            String(fig.absent),
+            String(fig.leave),
+            String(fig.gross),
+            String(fig.security),
+            String(fig.transport),
+            p.siteCode,
+            jvno,
+          ],
+        );
+        await client.query(
+          `INSERT INTO accmast (invno, invdate, ccode, pflag, edate, uname, tflag)
+           VALUES ($1,$2,$3,'P',$4,$5,'1')`,
+          [jvno, info.to, p.siteCode, edate, user],
+        );
+        const lines: [string, string, string, string][] = [
+          [String(fig.gross), '0', p.expenseCode, `${p.name}Salary For the ${info.mont}`],
+        ];
+        if (fig.transport > 0) {
+          lines.push(['0', String(fig.transport), p.transportCode, `${p.name} Tranport Revenue For the ${info.mont}`]);
+        }
+        if (fig.net > 0) {
+          lines.push(['0', String(fig.net), p.payableCode, `${p.campus} Net Salary For the ${info.mont}`]);
+        }
+        if (fig.security > 0) {
+          lines.push(['0', String(fig.security), p.securityCode, `${p.name} Loan Deduction  For the ${info.mont}`]);
+        }
+        for (const [dr, cr, acode, snar] of lines) {
+          await client.query(
+            `INSERT INTO accdet (invno, dr, cr, acode, snar) VALUES ($1,$2,$3,$4,$5)`,
+            [jvno, dr, cr, acode, snar],
+          );
+        }
+        created.push({ code: p.code, name: p.name, svno, jvno, net: fig.net });
+      }
+
+      const total = created.reduce((s, r) => s + r.net, 0);
+      return {
+        ok: created.length > 0,
+        message: created.length
+          ? `${created.length} salary posted for ${info.mont} · net ${total.toLocaleString('en-PK')}${skipped.length ? ` · ${skipped.length} skipped` : ''}.`
+          : skipped[0]?.reason || 'Nothing posted.',
+        created,
+        skipped,
+      };
+    });
+  }
 }
+
+type SalaryBase = {
+  code: string;
+  name: string;
+  designation: string;
+  siteCode: string;
+  campus: string;
+  regu: string;
+  basic: number;
+  houseRent: number;
+  conveyance: number;
+  utility: number;
+  mess: number;
+  otherAllowance: number;
+  payableCode: string;
+  securityCode: string;
+  transportCode: string;
+  expenseCode: string;
+  security: number;
+  transport: number;
+  posted: boolean;
+};

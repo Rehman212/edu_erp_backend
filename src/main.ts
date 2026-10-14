@@ -5,8 +5,8 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
-  app.use(json({ limit: '6mb' }));
-  app.use(urlencoded({ extended: true, limit: '6mb' }));
+  app.use(json({ limit: '12mb' }));
+  app.use(urlencoded({ extended: true, limit: '12mb' }));
   const corsOrigin = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
     .split(',')
     .map((value) => value.trim())
