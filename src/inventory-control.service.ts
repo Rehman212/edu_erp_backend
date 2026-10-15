@@ -1150,7 +1150,7 @@ export class InventoryControlService {
   async invoiceVoucher(username: string, invnoRaw: string) {
     const invno = invnoRaw.trim();
     if (!invno) {
-      return { ok: false, message: 'Invoice number is required.', master: null, lines: [] };
+      return { ok: false, message: 'Invoice number is required.', master: null, lines: [], accountLines: [] };
     }
 
     const scope = await this.siteScope(username, '');
@@ -1190,7 +1190,54 @@ export class InventoryControlService {
     );
 
     if (!master.rows[0]) {
-      return { ok: false, message: `Invoice ${invno} not found.`, master: null, lines: [] };
+      const fee = await this.database.query<{
+        invno: string;
+        siteCode: string;
+        siteName: string;
+        invDate: string | null;
+        narration: string;
+        kind: string;
+        kindTitle: string;
+      }>(
+        `SELECT trim(m.invno) AS invno,
+                trim(m.ccode) AS "siteCode",
+                coalesce(nullif(trim(a.ahead), ''), trim(m.ccode)) AS "siteName",
+                CASE
+                  WHEN trim(m.invdate) ~ '^\\d{4}-\\d{2}-\\d{2}'
+                  THEN to_char(trim(m.invdate)::date, 'YYYY-MM-DD')
+                  ELSE null
+                END AS "invDate",
+                coalesce(nullif(trim(m.nar), ''), '') AS narration,
+                right(upper(trim(m.invno)), 1) AS kind,
+                CASE right(upper(trim(m.invno)), 1)
+                  WHEN 'G' THEN 'Student Voucher'
+                  WHEN 'F' THEN 'Collection Voucher'
+                  ELSE 'Fee Voucher'
+                END AS "kindTitle"
+         FROM accmast m
+         LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+         WHERE trim(m.invno) = $1
+           AND ($2 = '' OR trim(m.ccode) LIKE $2 || '%')
+         ORDER BY m.row_id
+         LIMIT 1`,
+        [invno, scope.replace(/%/g, '')],
+      );
+      if (!fee.rows[0]) {
+        return { ok: false, message: `Invoice ${invno} not found.`, master: null, lines: [], accountLines: [] };
+      }
+      const accountLines = await this.voucherAccountLines(invno);
+      return {
+        ok: true,
+        message: 'OK',
+        master: fee.rows[0],
+        lines: [],
+        accountLines,
+        summary: {
+          totalQty: 0,
+          totalValue: accountLines.reduce((s, r) => s + r.debit + r.credit, 0),
+          lineCount: accountLines.length,
+        },
+      };
     }
 
     const lines = await this.database.query<{
@@ -1233,14 +1280,53 @@ export class InventoryControlService {
 
     const totalQty = mapped.reduce((s, r) => s + r.qty, 0);
     const totalValue = mapped.reduce((s, r) => s + r.value, 0);
+    const accountLines = await this.voucherAccountLines(invno);
 
     return {
       ok: true,
       message: 'OK',
       master: master.rows[0],
       lines: mapped,
+      accountLines,
       summary: { totalQty, totalValue, lineCount: mapped.length },
     };
+  }
+
+  private async voucherAccountLines(invno: string) {
+    const lines = await this.database.query<{
+      id: string;
+      accountCode: string;
+      accountName: string;
+      debit: string;
+      credit: string;
+      narration: string;
+    }>(
+      `SELECT d.row_id::text AS id,
+              trim(d.acode) AS "accountCode",
+              coalesce(nullif(trim(a.ahead), ''), trim(d.acode), '') AS "accountName",
+              CASE
+                WHEN coalesce(trim(d.dr), '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN trim(d.dr)
+                ELSE '0'
+              END AS debit,
+              CASE
+                WHEN coalesce(trim(d.cr), '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN trim(d.cr)
+                ELSE '0'
+              END AS credit,
+              coalesce(trim(d.snar), '') AS narration
+       FROM accdet d
+       LEFT JOIN acc a ON trim(a.acode) = trim(d.acode)
+       WHERE trim(d.invno) = $1
+       ORDER BY d.row_id`,
+      [invno],
+    );
+    return lines.rows.map((row) => ({
+      id: row.id,
+      accountCode: row.accountCode,
+      accountName: row.accountName,
+      debit: Number(row.debit) || 0,
+      credit: Number(row.credit) || 0,
+      narration: row.narration || '',
+    }));
   }
 
   /** Voucher list header filters → `AND …` SQL; pushes values onto params. */
