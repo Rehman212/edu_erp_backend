@@ -464,6 +464,7 @@ export class RegistrationService implements OnModuleInit {
               coalesce(trim(st.rollno), '') AS rollno,
               coalesce(trim(st.name), '') AS name,
               coalesce(trim(st.fname), '') AS "fatherName",
+              coalesce(trim(st.mname), '') AS "motherName",
               left(coalesce(st.dob::text, ''), 10) AS dob,
               coalesce(trim(st.gndr), '') AS gender,
               coalesce(trim(st.religion), '') AS religion,
@@ -471,6 +472,7 @@ export class RegistrationService implements OnModuleInit {
               coalesce(trim(st.caste), '') AS caste,
               coalesce(trim(st.occupat), '') AS occupation,
               coalesce(trim(st.fnic), '') AS "fatherCnic",
+              coalesce(trim(st.mnic), '') AS "motherCnic",
               coalesce(trim(st.bhcert), '') AS "birthCert",
               coalesce(trim(st.ftyr), '') AS "formBay",
               coalesce(trim(st.class), '') AS "classCode",
@@ -481,6 +483,7 @@ export class RegistrationService implements OnModuleInit {
               coalesce(nullif(trim(c.ahead), ''), coalesce(trim(st.ccode), '')) AS campus,
               coalesce(trim(st.paddress), '') AS address,
               coalesce(trim(st.cellno), '') AS phone,
+              coalesce(trim(st.whatsapp), '') AS whatsapp,
               coalesce(trim(st.rphone), '') AS "homePhone",
               coalesce(trim(st.ophone), '') AS "officePhone",
               coalesce(trim(st.gaurdian), '') AS guardian,
@@ -591,23 +594,24 @@ export class RegistrationService implements OnModuleInit {
 
     await this.database.query(
       `INSERT INTO student (
-         sdno, rollno, name, fname, dob, gndr, religion, nation, caste, occupat, fnic,
-         bhcert, ftyr, class, sec, sect, ccode, paddress, cellno, rphone, ophone,
+         sdno, rollno, name, fname, mname, dob, gndr, religion, nation, caste, occupat, fnic, mnic,
+         bhcert, ftyr, class, sec, sect, ccode, paddress, cellno, whatsapp, rphone, ophone,
          gaurdian, relation, stat, atyp, adate, ldate, dpj,
          adfee, regfee, migfee, tfee, anualfee, transfee, sumpack, security,
          plevel, lcerti, pschool, photo, remarks
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-         $12,$13,$14,$15,$15,$16,$17,$18,$19,$20,
-         $21,$22,$23,$24,$25,$26,$27,
-         $28,$29,$30,$31,$32,$33,$34,$35,
-         $36,$37,$38,$39,$40
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+         $14,$15,$16,$17,$17,$18,$19,$20,$21,$22,$23,
+         $24,$25,$26,$27,$28,$29,$30,
+         $31,$32,$33,$34,$35,$36,$37,$38,
+         $39,$40,$41,$42,$43
        )`,
       [
         sdno,
         String(body.rollno || '').trim() || null,
         name,
         String(body.fatherName || body.fname || '').trim() || null,
+        String(body.motherName || body.mname || '').trim() || null,
         leftDate(body.dob) || null,
         String(body.gender || body.gndr || '').trim() || null,
         String(body.religion || '').trim() || null,
@@ -615,6 +619,7 @@ export class RegistrationService implements OnModuleInit {
         String(body.caste || '').trim() || null,
         String(body.occupation || body.occupat || '').trim() || null,
         String(body.fatherCnic || body.fnic || '').trim() || null,
+        String(body.motherCnic || body.mnic || '').trim() || null,
         String(body.birthCert || body.bhcert || '').trim() || null,
         String(body.formBay || body.ftyr || '').trim() || null,
         String(body.classCode || body.class || '').trim() || null,
@@ -622,6 +627,7 @@ export class RegistrationService implements OnModuleInit {
         siteCode || null,
         String(body.address || body.paddress || '').trim() || null,
         String(body.phone || body.cellno || '').trim() || null,
+        String(body.whatsapp || '').trim() || null,
         String(body.homePhone || body.rphone || body.fatherPhone || '').trim() || null,
         String(body.officePhone || body.ophone || '').trim() || null,
         String(body.guardian || body.gaurdian || '').trim() || null,
@@ -669,6 +675,9 @@ export class RegistrationService implements OnModuleInit {
     if (body.fatherName !== undefined || body.fname !== undefined) {
       set('fname', String(body.fatherName || body.fname || '').trim() || null);
     }
+    if (body.motherName !== undefined || body.mname !== undefined) {
+      set('mname', String(body.motherName || body.mname || '').trim() || null);
+    }
     if (body.rollno !== undefined) set('rollno', String(body.rollno || '').trim() || null);
     if (body.dob !== undefined) set('dob', leftDate(body.dob) || null);
     if (body.gender !== undefined || body.gndr !== undefined) {
@@ -680,6 +689,9 @@ export class RegistrationService implements OnModuleInit {
     }
     if (body.fatherCnic !== undefined || body.fnic !== undefined) {
       set('fnic', String(body.fatherCnic || body.fnic || '').trim() || null);
+    }
+    if (body.motherCnic !== undefined || body.mnic !== undefined) {
+      set('mnic', String(body.motherCnic || body.mnic || '').trim() || null);
     }
     if (body.classCode !== undefined || body.class !== undefined) {
       set('class', String(body.classCode || body.class || '').trim() || null);
@@ -705,6 +717,9 @@ export class RegistrationService implements OnModuleInit {
     }
     if (body.phone !== undefined || body.cellno !== undefined) {
       set('cellno', String(body.phone || body.cellno || '').trim() || null);
+    }
+    if (body.whatsapp !== undefined) {
+      set('whatsapp', String(body.whatsapp || '').trim() || null);
     }
     if (body.homePhone !== undefined || body.rphone !== undefined || body.fatherPhone !== undefined) {
       set(
