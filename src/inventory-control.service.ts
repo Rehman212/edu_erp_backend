@@ -15,10 +15,25 @@ export type StockReportMode =
 
 @Injectable()
 export class InventoryControlService {
+  private narrationWidened = false;
+
   constructor(
     private readonly database: DatabaseService,
     private readonly activityLog: ActivityLogService,
   ) {}
+
+  /** Allow long voucher narration (~500 words) instead of short varchar. */
+  private async ensureWideNarration() {
+    if (this.narrationWidened) return;
+    try {
+      await this.database.query(`ALTER TABLE purmast ALTER COLUMN narp TYPE text`);
+      await this.database.query(`ALTER TABLE accmast ALTER COLUMN nar TYPE text`);
+      await this.database.query(`ALTER TABLE accdet ALTER COLUMN snar TYPE text`);
+    } catch {
+      /* already text / no rights — still try the insert */
+    }
+    this.narrationWidened = true;
+  }
 
   /**
    * ESS stock movement sign from invoice suffix:
@@ -1678,6 +1693,7 @@ export class InventoryControlService {
       return this.saveFeeVoucher(username, kind, body);
     }
 
+    await this.ensureWideNarration();
     const ccode = String(body.ccode ?? '').trim();
     if (!ccode) {
       return { ok: false, message: 'Department is required.' };
@@ -1811,6 +1827,7 @@ export class InventoryControlService {
       suffix?: string;
     },
   ) {
+    await this.ensureWideNarration();
     const ccode = String(body.ccode ?? '').trim();
     if (!ccode) {
       return { ok: false, message: 'Department is required.' };
