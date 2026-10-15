@@ -1665,6 +1665,12 @@ export class InventoryControlService {
       bcode?: string;
       aclas?: string;
       edate?: string;
+      lines?: Array<{
+        itemCode?: string;
+        qty?: string | number;
+        rate?: string | number;
+        unit?: string;
+      }>;
     },
   ) {
     const kind = String(body.kind ?? '').trim();
@@ -1713,38 +1719,72 @@ export class InventoryControlService {
       ? kind
       : '';
 
-    await this.database.query(
-      `INSERT INTO purmast
-         (invno, pcode, invdate, frt, discount, dparty, narp, pinv, gno, ccode, pflag, pday, atag)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [
-        invno,
-        String(body.pcode ?? '').trim() || null,
-        invdate,
-        String(body.frt ?? '').trim() || null,
-        String(body.discount ?? '').trim() || null,
-        String(body.dparty ?? '').trim() || null,
-        String(body.narp ?? '').trim() || null,
-        String(body.pinv ?? '').trim() || null,
-        String(body.gno ?? '').trim() || null,
-        ccode,
-        String(body.pflag ?? '1').trim() || '1',
-        String(body.pday ?? '0').trim() || '0',
-        atag || null,
-      ],
-    );
+    const detailLines = (Array.isArray(body.lines) ? body.lines : [])
+      .map((line) => {
+        const itemCode = String(line?.itemCode ?? '').trim();
+        const qty = Number(line?.qty);
+        const rate = Number(line?.rate);
+        const unit = String(line?.unit ?? '').trim() || 'PCS';
+        return {
+          itemCode,
+          qty: Number.isFinite(qty) ? qty : 0,
+          rate: Number.isFinite(rate) ? rate : 0,
+          unit,
+        };
+      })
+      .filter((line) => line.itemCode && line.qty !== 0);
+    if (!detailLines.length) {
+      return { ok: false, message: 'Add at least one item in Details.' };
+    }
+
+    await this.database.withTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO purmast
+           (invno, pcode, invdate, frt, discount, dparty, narp, pinv, gno, ccode, pflag, pday, atag)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [
+          invno,
+          String(body.pcode ?? '').trim() || null,
+          invdate,
+          String(body.frt ?? '').trim() || null,
+          String(body.discount ?? '').trim() || null,
+          String(body.dparty ?? '').trim() || null,
+          String(body.narp ?? '').trim() || null,
+          String(body.pinv ?? '').trim() || null,
+          String(body.gno ?? '').trim() || null,
+          ccode,
+          String(body.pflag ?? '1').trim() || '1',
+          String(body.pday ?? '0').trim() || '0',
+          atag || null,
+        ],
+      );
+      for (const line of detailLines) {
+        await client.query(
+          `INSERT INTO purdet (invno, itemno, qty, rate, unit, tamt)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            invno,
+            line.itemCode,
+            String(line.qty),
+            String(line.rate),
+            line.unit,
+            String(line.qty * line.rate),
+          ],
+        );
+      }
+    });
 
     const siteName = await this.siteName(ccode);
     await this.activityLog.write({
       category: 'activity',
       username,
       activity: 'Inventory Voucher Saved',
-      description: `Saved inventory voucher ${invno}`,
+      description: `Saved inventory voucher ${invno} (${detailLines.length} items)`,
       module: 'Inventory Voucher',
       campus: siteName,
       campusCode: ccode,
       status: 'Success',
-      meta: { invno },
+      meta: { invno, lines: detailLines.length },
     });
 
     return {

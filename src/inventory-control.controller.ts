@@ -164,6 +164,12 @@ export class InventoryControlController {
       bcode?: string;
       aclas?: string;
       edate?: string;
+      lines?: Array<{
+        itemCode?: string;
+        qty?: string | number;
+        rate?: string | number;
+        unit?: string;
+      }>;
     },
   ) {
     return this.inventory.saveVoucher(user ?? '', body ?? {});
