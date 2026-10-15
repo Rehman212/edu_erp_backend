@@ -215,7 +215,7 @@ export class RegistrationService implements OnModuleInit {
     colFilters: Record<string, string> = {},
   ) {
     const scope = await this.siteScope(username, site);
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 1000);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
     const params: unknown[] = [];
