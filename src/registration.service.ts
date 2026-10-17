@@ -22,7 +22,11 @@ export class RegistrationService implements OnModuleInit {
 
   async onModuleInit() {
     await this.database.query(
-      `ALTER TABLE student ADD COLUMN IF NOT EXISTS remarks text`,
+      `ALTER TABLE student
+         ADD COLUMN IF NOT EXISTS remarks text,
+         ADD COLUMN IF NOT EXISTS mname varchar(120),
+         ADD COLUMN IF NOT EXISTS mnic varchar(40),
+         ADD COLUMN IF NOT EXISTS whatsapp varchar(40)`,
     );
   }
 
@@ -795,10 +799,17 @@ export class RegistrationService implements OnModuleInit {
 
     if (!sets.length) return { ok: false, message: 'Nothing to update.' };
     values.push(sdno);
-    const result = await this.database.query(
-      `UPDATE student SET ${sets.join(', ')} WHERE trim(sdno) = $${values.length}`,
-      values,
-    );
+    let result;
+    try {
+      result = await this.database.query(
+        `UPDATE student SET ${sets.join(', ')} WHERE trim(sdno) = $${values.length}`,
+        values,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[registration] update ${sdno} failed:`, message);
+      return { ok: false, message: `Student update failed: ${message}` };
+    }
     if (!result.rowCount) return { ok: false, message: 'Student not found.' };
     void username;
     return { ok: true, message: `Student ${sdno} updated.`, code: sdno, sdno };
