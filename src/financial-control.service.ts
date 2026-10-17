@@ -42,6 +42,8 @@ type DefaulterOut = {
   sdno: string;
   name: string;
   status: string;
+  className?: string;
+  sectionName?: string;
   campus: string;
   fromDate: string;
   toDate: string;
@@ -63,6 +65,8 @@ const DEFAULTER_COLS = {
     type: 'like',
   },
   campus: { get: (r: DefaulterOut) => r.campus, type: 'exact' },
+  className: { get: (r: DefaulterOut) => r.className, type: 'exact' },
+  sectionName: { get: (r: DefaulterOut) => r.sectionName, type: 'exact' },
   outstanding: { get: (r: DefaulterOut) => r.outstanding, type: 'num' },
   bankCode: { get: (r: DefaulterOut) => r.bankCode, type: 'like' },
   bankName: { get: (r: DefaulterOut) => r.bankName, type: 'exact' },
@@ -71,6 +75,8 @@ const DEFAULTER_COLS = {
 function defaulterOptions(rows: DefaulterOut[]) {
   return {
     campus: distinctSorted(rows.map((r) => r.campus)),
+    className: distinctSorted(rows.map((r) => r.className)),
+    sectionName: distinctSorted(rows.map((r) => r.sectionName)),
     status: distinctSorted(rows.map((r) => r.status)),
     bankName: distinctSorted(rows.map((r) => r.bankName)),
   };
@@ -87,6 +93,29 @@ export class FinancialControlService {
   private readonly creditSql = NUM('d', 'cr');
 
   /** Lexicographic range on text invdate ('YYYY-MM-DD …'). toExclusive = day after toDate. */
+  /** Replace class codes with class names and add section names from the student record. */
+  private async withClassSection<T extends { sdno: string; className?: string; sectionName?: string }>(rows: T[]) {
+    const sdnos = [...new Set(rows.map((r) => r.sdno).filter(Boolean))];
+    if (!sdnos.length) return rows;
+    const info = await this.database.query<{ sdno: string; className: string; sectionName: string }>(
+      `SELECT trim(st.sdno) AS sdno,
+              coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
+              coalesce(nullif(trim(se.ahead), ''), '') AS "sectionName"
+       FROM student st
+       LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
+       WHERE st.sdno = ANY($1::text[])`,
+      [sdnos],
+    );
+    const bySdno = new Map(info.rows.map((r) => [r.sdno, r]));
+    for (const row of rows) {
+      const hit = bySdno.get(row.sdno);
+      row.className = hit?.className || row.className || '';
+      row.sectionName = hit?.sectionName || '';
+    }
+    return rows;
+  }
+
   private periodBounds(fromDate: string, toDate: string) {
     const from = this.normDate(fromDate) || this.monthStart();
     const to = this.normDate(toDate) || this.today();
@@ -1197,8 +1226,10 @@ export class FinancialControlService {
         debit: round2(debit),
         credit: round2(credit),
         outstanding: round2(debit - credit),
+        sectionName: '',
       };
     });
+    await this.withClassSection(mapped);
     const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
     const slice = filtered.slice(offset, offset + size);
     const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
@@ -1479,8 +1510,10 @@ export class FinancialControlService {
         debit: round2(debit),
         credit: round2(credit),
         outstanding: round2(debit - credit),
+        sectionName: '',
       };
     });
+    await this.withClassSection(mapped);
     const slice = mapped.slice(offset, offset + size);
     const totalOutstanding = mapped.reduce((s, r) => s + r.outstanding, 0);
 
@@ -1649,8 +1682,10 @@ export class FinancialControlService {
         debit: round2(debit),
         credit: round2(credit),
         outstanding: round2(debit - credit),
+        sectionName: '',
       };
     });
+    await this.withClassSection(mapped);
     const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
     const slice = filtered.slice(offset, offset + size);
     const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
