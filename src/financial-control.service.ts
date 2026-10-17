@@ -2044,63 +2044,10 @@ export class FinancialControlService {
    * `q` is a student ID or any challan number of that student (e.g. 386569G / 386569).
    */
   async studentChallans(username: string, qRaw: string, onlyRaw = '') {
-    const q = String(qRaw || '').trim().toUpperCase();
-    if (!q) return { ok: false, message: 'Enter a student ID or challan number.', student: null, challans: [] };
-
-    let sdno = q;
-    if (/^\d+[GF]?$/.test(q)) {
-      const num = q.replace(/[GF]$/, '');
-      const found = await this.database.query<{ sdno: string }>(
-        `SELECT coalesce(trim(sdno), '') AS sdno FROM accmast WHERE invno IN ($1, $2) LIMIT 1`,
-        [`${num}G`, `${num}F`],
-      );
-      sdno = found.rows[0]?.sdno || '';
-      if (!sdno && /^\d+$/.test(q)) {
-        const st = await this.database.query<{ sdno: string }>(
-          `SELECT trim(sdno) AS sdno FROM student WHERE sdno IN ($1, $2) LIMIT 1`,
-          [q, `${q}S`],
-        );
-        sdno = st.rows[0]?.sdno || '';
-      }
-      if (!sdno) {
-        return { ok: false, message: `No challan or student found for ${q}.`, student: null, challans: [] };
-      }
-    }
-
-    const student = await this.database.query<{
-      sdno: string;
-      name: string;
-      fatherName: string;
-      status: string;
-      siteCode: string;
-      campus: string;
-      classCode: string;
-      className: string;
-      sectionName: string;
-    }>(
-      `SELECT trim(st.sdno) AS sdno,
-              coalesce(trim(st.name), '') AS name,
-              coalesce(trim(st.fname), '') AS "fatherName",
-              coalesce(trim(st.stat), '') AS status,
-              coalesce(trim(st.ccode), '') AS "siteCode",
-              coalesce(nullif(trim(camp.ahead), ''), trim(st.ccode), '') AS campus,
-              coalesce(trim(st.class), '') AS "classCode",
-              coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
-              coalesce(nullif(trim(se.ahead), ''), trim(st.sec), '') AS "sectionName"
-       FROM student st
-       LEFT JOIN acc camp ON camp.acode = st.ccode
-       LEFT JOIN acc cl ON cl.acode = st.class
-       LEFT JOIN acc se ON se.acode = st.sec
-       WHERE st.sdno = $1
-       LIMIT 1`,
-      [sdno],
-    );
-    const info = student.rows[0];
-    if (!info) return { ok: false, message: `Student ${sdno} not found.`, student: null, challans: [] };
-    const zone = await this.zonePrefix(username);
-    if (zone && info.siteCode && !info.siteCode.startsWith(zone)) {
-      return { ok: false, message: 'Student outside your zone.', student: null, challans: [] };
-    }
+    const found = await this.findChallanStudent(username, qRaw);
+    if (!found.info) return { ok: false, message: found.message, student: null, challans: [] };
+    const info = found.info;
+    const sdno = info.sdno;
 
     const only = String(onlyRaw || '')
       .split(',')
@@ -2153,6 +2100,149 @@ export class FinancialControlService {
         amount: round2(Number(r.amount) || 0),
       })),
     };
+  }
+
+  /** Every fee bill of one student (all months) with its paid status and receipt. */
+  async studentLedger(username: string, qRaw: string) {
+    const found = await this.findChallanStudent(username, qRaw);
+    if (!found.info) return { ok: false, message: found.message, student: null, rows: [] };
+    const rows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      dueDate: string;
+      mont: string;
+      narration: string;
+      amount: string;
+      receipt: string;
+      paidDate: string;
+      bankCode: string;
+      bankName: string;
+    }>(
+      `SELECT trim(m.invno) AS invno,
+              left(coalesce(m.invdate, ''), 10) AS invdate,
+              left(coalesce(m.dudate, ''), 10) AS "dueDate",
+              coalesce(trim(m.mont), '') AS mont,
+              coalesce(trim(m.nar), '') AS narration,
+              coalesce(sum(${this.debitSql}), 0)::text AS amount,
+              coalesce(trim(f.invno), '') AS receipt,
+              left(coalesce(f.invdate, ''), 10) AS "paidDate",
+              coalesce(trim(f.bcode), '') AS "bankCode",
+              coalesce(nullif(trim(bk.ahead), ''), '') AS "bankName"
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       LEFT JOIN accmast f ON f.invno = left(trim(m.invno), length(trim(m.invno)) - 1) || 'F'
+       LEFT JOIN acc bk ON bk.acode = f.bcode
+       WHERE m.sdno = $1
+         AND m.invno LIKE '%G'
+       GROUP BY m.invno, m.invdate, m.dudate, m.mont, m.nar, f.invno, f.invdate, f.bcode, bk.ahead
+       ORDER BY right(trim(m.mont), 4) || left(trim(m.mont), 2) DESC, m.invno DESC
+       LIMIT 1000`,
+      [found.info.sdno],
+    );
+    return {
+      ok: true,
+      student: found.info,
+      rows: rows.rows.map((r) => ({
+        invno: r.invno,
+        invdate: r.invdate,
+        dueDate: r.dueDate,
+        mont: r.mont,
+        narration: r.narration,
+        amount: round2(Number(r.amount) || 0),
+        paid: !!r.receipt,
+        receipt: r.receipt,
+        paidDate: r.paidDate,
+        bankCode: r.bankCode,
+        bankName: r.bankName,
+      })),
+    };
+  }
+
+  /** Reverse several payments; newest first so split balances fold back in order. */
+  async reversePayments(username: string, invnosRaw: unknown) {
+    const invnos = [
+      ...new Set(
+        (Array.isArray(invnosRaw) ? invnosRaw : [])
+          .map((v) => String(v || '').trim().toUpperCase().replace(/[GF]$/, ''))
+          .filter((v) => /^\d+$/.test(v)),
+      ),
+    ].sort((a, b) => Number(b) - Number(a));
+    if (!invnos.length) return { ok: false, message: 'Select at least one paid challan.', done: [], failed: [] };
+
+    const done: string[] = [];
+    const failed: Array<{ invno: string; message: string }> = [];
+    for (const num of invnos) {
+      const result = await this.reversePayment(username, `${num}G`);
+      if (result.ok) done.push(`${num}G`);
+      else failed.push({ invno: `${num}G`, message: result.message });
+    }
+    return {
+      ok: done.length > 0,
+      message: failed.length
+        ? `${done.length} challan(s) marked unpaid, ${failed.length} failed: ${failed.map((f) => `${f.invno} (${f.message})`).join('; ')}`
+        : `${done.length} challan(s) marked unpaid.`,
+      done,
+      failed,
+    };
+  }
+
+  private async findChallanStudent(username: string, qRaw: string) {
+    const q = String(qRaw || '').trim().toUpperCase();
+    if (!q) return { info: null, message: 'Enter a student ID or challan number.' };
+
+    let sdno = q;
+    if (/^\d+[GF]?$/.test(q)) {
+      const num = q.replace(/[GF]$/, '');
+      const found = await this.database.query<{ sdno: string }>(
+        `SELECT coalesce(trim(sdno), '') AS sdno FROM accmast WHERE invno IN ($1, $2) LIMIT 1`,
+        [`${num}G`, `${num}F`],
+      );
+      sdno = found.rows[0]?.sdno || '';
+      if (!sdno && /^\d+$/.test(q)) {
+        const st = await this.database.query<{ sdno: string }>(
+          `SELECT trim(sdno) AS sdno FROM student WHERE sdno IN ($1, $2) LIMIT 1`,
+          [q, `${q}S`],
+        );
+        sdno = st.rows[0]?.sdno || '';
+      }
+      if (!sdno) return { info: null, message: `No challan or student found for ${q}.` };
+    }
+
+    const student = await this.database.query<{
+      sdno: string;
+      name: string;
+      fatherName: string;
+      status: string;
+      siteCode: string;
+      campus: string;
+      classCode: string;
+      className: string;
+      sectionName: string;
+    }>(
+      `SELECT trim(st.sdno) AS sdno,
+              coalesce(trim(st.name), '') AS name,
+              coalesce(trim(st.fname), '') AS "fatherName",
+              coalesce(trim(st.stat), '') AS status,
+              coalesce(trim(st.ccode), '') AS "siteCode",
+              coalesce(nullif(trim(camp.ahead), ''), trim(st.ccode), '') AS campus,
+              coalesce(trim(st.class), '') AS "classCode",
+              coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
+              coalesce(nullif(trim(se.ahead), ''), trim(st.sec), '') AS "sectionName"
+       FROM student st
+       LEFT JOIN acc camp ON camp.acode = st.ccode
+       LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = st.sec
+       WHERE st.sdno = $1
+       LIMIT 1`,
+      [sdno],
+    );
+    const info = student.rows[0];
+    if (!info) return { info: null, message: `Student ${sdno} not found.` };
+    const zone = await this.zonePrefix(username);
+    if (zone && info.siteCode && !info.siteCode.startsWith(zone)) {
+      return { info: null, message: 'Student outside your zone.' };
+    }
+    return { info, message: '' };
   }
 
   /**

@@ -402,6 +402,16 @@ export class FinancialControlController {
     return this.finance.reversePayment(user ?? '', body?.invno ?? '');
   }
 
+  @Post('reverse-payments')
+  reversePayments(@Headers('x-ess-user') user: string | undefined, @Body() body: { invnos?: string[] }) {
+    return this.finance.reversePayments(user ?? '', body?.invnos);
+  }
+
+  @Get('student-ledger')
+  studentLedger(@Headers('x-ess-user') user: string | undefined, @Query('q') q?: string) {
+    return this.finance.studentLedger(user ?? '', q ?? '');
+  }
+
   @Delete('voucher')
   deleteVoucher(
     @Headers('x-ess-user') user: string | undefined,
