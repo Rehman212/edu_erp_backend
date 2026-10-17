@@ -1949,6 +1949,11 @@ export class FinancialControlService {
       return { ok: false, message: existing.message || 'Voucher not found' };
     }
 
+    const bill = await this.database.query(`SELECT 1 FROM accmast WHERE invno = $1 LIMIT 1`, [
+      `${invno.slice(0, -1)}G`,
+    ]);
+    if (bill.rowCount) return this.reversePayment(username, invno);
+
     try {
       await this.database.withTransaction(async (client) => {
         await client.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
@@ -2345,6 +2350,118 @@ export class FinancialControlService {
       balances,
       balanceTotal,
       balanceDue,
+    };
+  }
+
+  /**
+   * Undo a fee payment: removes the …F receipt and, if that payment split the bill, folds the
+   * unpaid "(Balance)" challan it created back into the original …G.
+   */
+  async reversePayment(username: string, invnoRaw: string) {
+    const raw = String(invnoRaw || '').trim().toUpperCase();
+    if (!/^\d+[GF]?$/.test(raw)) return { ok: false, message: 'Enter a valid challan or receipt number.' };
+    const num = raw.replace(/[GF]$/, '');
+    const gInv = `${num}G`;
+    const fInv = `${num}F`;
+    const zone = await this.zonePrefix(username);
+    let restored = 0;
+    let merged = '';
+    let sdno = '';
+    let ccode = '';
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        await this.lockFeeSequence(client);
+        const f = await client.query<{ invdate: string; ccode: string; sdno: string }>(
+          `SELECT left(trim(invdate), 10) AS invdate, coalesce(trim(ccode), '') AS ccode,
+                  coalesce(trim(sdno), '') AS sdno
+           FROM accmast WHERE invno = $1 LIMIT 1 FOR UPDATE`,
+          [fInv],
+        );
+        const receipt = f.rows[0];
+        if (!receipt) throw new Error(`Challan ${gInv} is not paid.`);
+        if (zone && receipt.ccode && !receipt.ccode.startsWith(zone)) {
+          throw new Error(`Receipt ${fInv} is outside your zone.`);
+        }
+        sdno = receipt.sdno;
+        ccode = receipt.ccode;
+
+        await client.query(`DELETE FROM accdet WHERE invno = $1`, [fInv]);
+        await client.query(`DELETE FROM accmast WHERE invno = $1`, [fInv]);
+
+        const g = await client.query<{ nar: string; sdno: string; mont: string; u4: string }>(
+          `SELECT coalesce(trim(nar), '') AS nar, coalesce(trim(sdno), '') AS sdno,
+                  coalesce(trim(mont), '') AS mont, coalesce(trim(u4), '') AS u4
+           FROM accmast WHERE invno = $1 LIMIT 1 FOR UPDATE`,
+          [gInv],
+        );
+        const bill = g.rows[0];
+        if (!bill) return;
+
+        const balNar = `${bill.nar.replace(/\s*\(Balance\)$/i, '')} (Balance)`;
+        const bal = await client.query<{ invno: string; paid: boolean }>(
+          `SELECT trim(b.invno) AS invno, ${G_PAID_SQL('b')} AS paid
+           FROM accmast b
+           WHERE right(trim(b.invno), 1) = 'G'
+             AND b.invno > $1
+             AND coalesce(trim(b.sdno), '') = $2
+             AND coalesce(trim(b.mont), '') = $3
+             AND coalesce(trim(b.u4), '') = $4
+             AND trim(b.nar) = $5
+             AND left(trim(b.invdate), 10) = $6
+           ORDER BY b.invno
+           LIMIT 1
+           FOR UPDATE OF b`,
+          [gInv, bill.sdno, bill.mont, bill.u4, balNar, receipt.invdate],
+        );
+        const balInv = bal.rows[0]?.invno;
+        if (!balInv || bal.rows[0]?.paid) return;
+
+        const amt = await client.query<{ amount: string }>(
+          `SELECT coalesce(sum(${NUM('d', 'dr')}), 0)::text AS amount FROM accdet d WHERE d.invno = $1`,
+          [balInv],
+        );
+        const extra = round2(Number(amt.rows[0]?.amount) || 0);
+        if (extra > 0) {
+          await client.query(
+            `UPDATE accdet SET dr = ((${NUM('accdet', 'dr')}) + $2)::text
+             WHERE invno = $1 AND (${NUM('accdet', 'dr')}) > 0`,
+            [gInv, extra],
+          );
+          await client.query(
+            `UPDATE accdet SET cr = ((${NUM('accdet', 'cr')}) + $2)::text
+             WHERE invno = $1 AND (${NUM('accdet', 'cr')}) > 0`,
+            [gInv, extra],
+          );
+        }
+        await client.query(`DELETE FROM accdet WHERE invno = $1`, [balInv]);
+        await client.query(`DELETE FROM accmast WHERE invno = $1`, [balInv]);
+        restored = extra;
+        merged = balInv;
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to reverse payment.';
+      return { ok: false, message };
+    }
+
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Fee Payment Reversed',
+      description: `Reversed payment ${fInv} for ${sdno}${merged ? ` · merged balance ${merged} (${restored.toFixed(2)}) back into ${gInv}` : ''}`,
+      module: 'Fee Control',
+      campus: '',
+      campusCode: ccode,
+      status: 'Success',
+      meta: { invno: gInv, receipt: fInv, merged, restored },
+    });
+
+    return {
+      ok: true,
+      message: merged
+        ? `Payment reversed. ${gInv} is unpaid again (balance ${merged} merged back).`
+        : `Payment reversed. ${gInv} is unpaid again.`,
+      sdno,
     };
   }
 

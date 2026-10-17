@@ -397,6 +397,11 @@ export class FinancialControlController {
     return this.finance.receivePayment(user ?? '', body ?? {});
   }
 
+  @Post('reverse-payment')
+  reversePayment(@Headers('x-ess-user') user: string | undefined, @Body() body: { invno?: string }) {
+    return this.finance.reversePayment(user ?? '', body?.invno ?? '');
+  }
+
   @Delete('voucher')
   deleteVoucher(
     @Headers('x-ess-user') user: string | undefined,
