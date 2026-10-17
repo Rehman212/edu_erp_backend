@@ -599,28 +599,130 @@ export class PayrollService {
     page = 1,
     pageSize = 50,
   ) {
-    const base = await this.personaRows(username, {
-      site,
-      employee,
-      page,
-      pageSize,
+    const code = String(employee || '').trim();
+    const from = String(fromDate || '').trim();
+    const to = String(toDate || '').trim();
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), PAGE_MAX);
+    const current = Math.max(Number(page) || 1, 1);
+    const meta = { site, employee: code, fromDate: from, toDate: to, needEmployee: !code };
+    if (
+      !code ||
+      !(await this.tableExists('salarym')) ||
+      !(await this.tableExists('salaryd'))
+    ) {
+      return { rows: [], total: 0, page: current, pageSize: size, totalAmount: 0, meta };
+    }
+    const scope = await this.siteScope(username, site);
+    const pc = (await this.tableExists('persona'))
+      ? this.personaCols(await this.columns('persona'))
+      : null;
+    const hasP = !!(pc?.code && pc?.name);
+
+    const params: unknown[] = [code];
+    const where: string[] = [`upper(trim(m.ecode)) = upper($1)`];
+    if (from) {
+      params.push(from);
+      where.push(
+        `(nullif(trim(d.tdate::text), '') IS NULL
+          OR left(trim(d.tdate::text), 10)::date >= $${params.length}::date)`,
+      );
+    }
+    if (to) {
+      params.push(to);
+      where.push(
+        `(nullif(trim(d.fdate::text), '') IS NULL
+          OR left(trim(d.fdate::text), 10)::date <= $${params.length}::date)`,
+      );
+    }
+    if (scope) {
+      params.push(scope);
+      where.push(
+        `(coalesce(trim(m.zcode), '') = '' OR trim(m.zcode) LIKE $${params.length} || '%'
+          OR $${params.length} LIKE trim(m.zcode) || '%')`,
+      );
+    }
+
+    const res = await this.database.query<Record<string, string>>(
+      `SELECT trim(m.ecode) AS code,
+              ${hasP ? `coalesce(nullif(trim(p.${pc!.name}), ''), trim(m.ecode))` : `trim(m.ecode)`} AS name,
+              ${hasP && pc!.design ? `coalesce(trim(p.${pc!.design}), '')` : `''`} AS designation,
+              coalesce(nullif(trim(m.zcode), ''), coalesce(trim(d.stcode), '')) AS "siteCode",
+              trim(m.mont) AS month,
+              left(coalesce(d.fdate::text, ''), 10) AS "fromDate",
+              left(coalesce(d.tdate::text, ''), 10) AS "toDate",
+              trim(m.svno) AS svno,
+              coalesce(trim(d.jvno), '') AS jvno,
+              coalesce(nullif(trim(d.salary), ''), nullif(trim(m.mbsal), ''), '0') AS earned,
+              coalesce(nullif(trim(m.mbsal), ''), '0') AS full_basic,
+              (coalesce(nullif(trim(m.mhrant), ''), '0')::numeric
+               + coalesce(nullif(trim(m.mconv), ''), '0')::numeric
+               + coalesce(nullif(trim(m.mutil), ''), '0')::numeric
+               + coalesce(nullif(trim(m.motall), ''), '0')::numeric
+               + coalesce(nullif(trim(m.mmess), ''), '0')::numeric)::text AS full_allow,
+              coalesce(nullif(trim(d.spall), ''), '0') AS spall,
+              coalesce(nullif(trim(d.mess), ''), '0') AS mess,
+              coalesce(nullif(trim(d.mna), ''), '0') AS mna,
+              coalesce(nullif(trim(d.loan), ''), '0') AS loan,
+              coalesce(nullif(trim(d.adva), ''), '0') AS adva,
+              coalesce(nullif(trim(d.itax), ''), '0') AS itax,
+              coalesce(nullif(trim(d.abs), ''), '0') AS absent
+       FROM salarym m
+       JOIN salaryd d ON trim(m.svno) = trim(d.svno)
+       ${hasP ? `LEFT JOIN persona p ON trim(p.${pc!.code}) = trim(m.ecode)` : ''}
+       WHERE ${where.join(' AND ')}
+       ORDER BY left(coalesce(d.fdate::text, ''), 10), m.row_id
+       LIMIT 2000`,
+      params,
+    );
+
+    let running = 0;
+    const all = res.rows.map((r) => {
+      const earned = moneyNum(r.earned);
+      const extras = moneyNum(r.spall) + moneyNum(r.mess) + moneyNum(r.mna);
+      const basic = round2(moneyNum(r.full_basic) || earned);
+      const fullAllow = moneyNum(r.full_allow);
+      const security = Math.abs(moneyNum(r.loan));
+      const advance = Math.abs(moneyNum(r.adva));
+      const transport = Math.abs(moneyNum(r.itax));
+      const deductions = round2(security + advance + transport);
+      const net = round2(earned + extras - deductions);
+      running = round2(running + net);
+      return {
+        code: r.code,
+        name: r.name,
+        designation: r.designation,
+        siteCode: r.siteCode,
+        campus: r.siteCode,
+        month: r.month,
+        date: r.toDate || r.fromDate,
+        fromDate: r.fromDate,
+        toDate: r.toDate,
+        voucherNo: r.svno,
+        jvno: r.jvno,
+        narration: `Salary for ${r.month}`,
+        basic,
+        allowances: round2(fullAllow + extras),
+        absentDays: round2(moneyNum(r.absent)),
+        absentCut: round2(Math.max(0, basic + fullAllow - earned)),
+        security: round2(security),
+        advance: round2(advance),
+        transport: round2(transport),
+        deductions,
+        gross: round2(earned + extras),
+        net,
+        credit: net,
+        debit: 0,
+        balance: running,
+      };
     });
-    const rows = base.rows.map((r) => ({
-      ...r,
-      fromDate: fromDate || '',
-      toDate: toDate || '',
-      debit: 0,
-      credit: round2(Number(r.salary) || 0),
-      balance: round2(-(Number(r.salary) || 0)),
-      narration: '',
-    }));
+    const offset = (current - 1) * size;
     return {
-      rows,
-      total: base.total,
-      page,
-      pageSize,
-      totalAmount: round2(rows.reduce((s, r) => s + r.credit, 0)),
-      meta: { site, employee, fromDate, toDate },
+      rows: all.slice(offset, offset + size),
+      total: all.length,
+      page: current,
+      pageSize: size,
+      totalAmount: running,
+      meta,
     };
   }
 

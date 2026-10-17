@@ -1537,6 +1537,7 @@ export class InventoryControlService {
     siteRaw = '',
     colFilters: Record<string, string> = {},
     optionsOnly = false,
+    q = '',
   ) {
     const current = Math.max(1, Number(page) || 1);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
@@ -1594,6 +1595,23 @@ export class InventoryControlService {
       narp: { expr: 'trim(m.narp)', type: 'like' },
       discount: { expr: 'trim(m.discount)', type: 'money' },
     });
+    let searchSql = '';
+    const search = String(q || '').trim();
+    if (search) {
+      params.push(`%${search}%`);
+      const i = params.length;
+      searchSql = `AND (m.invno ILIKE $${i}
+        OR m.invdate ILIKE $${i}
+        OR (trim(m.invdate) ~ '^\\d{4}-\\d{2}-\\d{2}'
+            AND to_char(left(trim(m.invdate), 10)::date, 'DD/MM/YYYY') ILIKE $${i})
+        OR ${siteExpr} ILIKE $${i}
+        OR m.pcode ILIKE $${i}
+        OR m.dparty ILIKE $${i}
+        OR m.pinv ILIKE $${i}
+        OR m.gno ILIKE $${i}
+        OR m.narp ILIKE $${i}
+        OR m.discount ILIKE $${i})`;
+    }
 
     const total = await this.database.query<{ n: string }>(
       `SELECT count(*)::text AS n
@@ -1601,7 +1619,8 @@ export class InventoryControlService {
        LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
        WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
          ${typeWhere}
-         ${colFilterSql}`,
+         ${colFilterSql}
+         ${searchSql}`,
       params,
     );
 
@@ -1644,6 +1663,7 @@ export class InventoryControlService {
        WHERE ($1 = '' OR trim(m.ccode) LIKE $1 || '%')
          ${typeWhere}
          ${colFilterSql}
+         ${searchSql}
        ORDER BY m.row_id DESC
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, size, offset],

@@ -136,6 +136,8 @@ export class InventoryControlController {
       kind ?? '',
       site ?? '',
       colFiltersFrom(all),
+      false,
+      all?.q ?? '',
     );
   }
 
