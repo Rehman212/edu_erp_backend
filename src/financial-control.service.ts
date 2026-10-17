@@ -92,7 +92,6 @@ export class FinancialControlService {
     const to = this.normDate(toDate) || this.today();
     return { from, to, toExclusive: this.nextDay(to) };
   }
-
   async sites(username: string) {
     const zone = await this.zonePrefix(username);
     const rows = await this.database.query<{ code: string; name: string }>(
@@ -2051,7 +2050,16 @@ export class FinancialControlService {
         [`${num}G`, `${num}F`],
       );
       sdno = found.rows[0]?.sdno || '';
-      if (!sdno) return { ok: false, message: `Challan ${q} not found.`, student: null, challans: [] };
+      if (!sdno && /^\d+$/.test(q)) {
+        const st = await this.database.query<{ sdno: string }>(
+          `SELECT trim(sdno) AS sdno FROM student WHERE sdno IN ($1, $2) LIMIT 1`,
+          [q, `${q}S`],
+        );
+        sdno = st.rows[0]?.sdno || '';
+      }
+      if (!sdno) {
+        return { ok: false, message: `No challan or student found for ${q}.`, student: null, challans: [] };
+      }
     }
 
     const student = await this.database.query<{
