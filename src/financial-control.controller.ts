@@ -359,6 +359,42 @@ export class FinancialControlController {
     return this.finance.updateVoucher(user ?? '', body ?? {});
   }
 
+  @Get('student-challans')
+  studentChallans(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('q') q?: string,
+    @Query('only') only?: string,
+  ) {
+    return this.finance.studentChallans(user ?? '', q ?? '', only ?? '');
+  }
+
+  @Post('generate-challans')
+  generateChallans(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { sdno?: string; mont?: string },
+  ) {
+    return this.finance.generateChallans(user ?? '', body?.sdno ?? '', body?.mont ?? '');
+  }
+
+  @Get('student-dues')
+  studentDues(@Query('sdnos') sdnos?: string) {
+    return this.finance.studentDues(sdnos ?? '');
+  }
+
+  @Post('receive-payment')
+  receivePayment(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body()
+    body: {
+      payDate?: string;
+      bankCode?: string;
+      balanceMode?: string;
+      lines?: Array<{ invno?: string; received?: number | string }>;
+    },
+  ) {
+    return this.finance.receivePayment(user ?? '', body ?? {});
+  }
+
   @Delete('voucher')
   deleteVoucher(
     @Headers('x-ess-user') user: string | undefined,

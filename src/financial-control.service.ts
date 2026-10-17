@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import type { PoolClient } from 'pg';
 import { ActivityLogService } from './activity-log.service';
 import { DatabaseService } from './database.service';
 
@@ -27,6 +28,15 @@ const FEE_VOUCHER_COLS = {
   narration: { expr: 'b.narr', type: 'like' },
   amount: { expr: 'b.amount', type: 'num' },
 } as const;
+
+const FEE_REGISTER_COLS = {
+  ...FEE_VOUCHER_COLS,
+  paid: { expr: `CASE WHEN b.paid THEN 'PAID' ELSE 'UNPAID' END`, type: 'exact' },
+} as const;
+
+/** A fee bill (…G) is paid when a receipt (…F) with the same number exists. */
+const G_PAID_SQL = (alias: string) =>
+  `EXISTS (SELECT 1 FROM accmast fx WHERE fx.invno = left(trim(${alias}.invno), length(trim(${alias}.invno)) - 1) || 'F')`;
 
 type DefaulterOut = {
   sdno: string;
@@ -1252,6 +1262,7 @@ export class FinancialControlService {
               coalesce(m.mont, '') AS mont,
               coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
               coalesce(nullif(trim(st.name), ''), '') AS "studentName",
+              ${G_PAID_SQL('m')} AS paid,
               coalesce(sum(${this.debitSql}), 0) AS amount
        FROM accmast m
        JOIN accdet d ON d.invno = m.invno
@@ -1262,7 +1273,7 @@ export class FinancialControlService {
 
     const options =
       current === 1 ? await this.feeVoucherOptions(baseWhere, [...params]) : undefined;
-    const colWhere = colFilterOutSql(colFilters, FEE_VOUCHER_COLS, params);
+    const colWhere = colFilterOutSql(colFilters, FEE_REGISTER_COLS, params);
 
     const count = await this.database.query<{ total: string; amount: string }>(
       `WITH base AS (${baseSql})
@@ -1283,11 +1294,12 @@ export class FinancialControlService {
       mont: string;
       sdno: string;
       studentName: string;
+      paid: boolean;
       amount: string;
     }>(
       `WITH base AS (${baseSql})
        SELECT b.invno, b.invdate, b.narr, b."siteCode", b."siteName", b.mont, b.sdno,
-              b."studentName", b.amount::text AS amount
+              b."studentName", b.paid, b.amount::text AS amount
        FROM base b ${colWhere}
        ORDER BY b.invdate DESC, b.invno DESC
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
@@ -1305,6 +1317,7 @@ export class FinancialControlService {
         mont: r.mont,
         sdno: r.sdno,
         studentName: r.studentName,
+        paid: Boolean(r.paid),
         amount: round2(Number(r.amount) || 0),
       })),
       total: Number(count.rows[0]?.total) || 0,
@@ -1996,6 +2009,482 @@ export class FinancialControlService {
     };
   }
 
+  /**
+   * Unpaid fee bills (…G without a matching …F) for one student.
+   * `q` is a student ID or any challan number of that student (e.g. 386569G / 386569).
+   */
+  async studentChallans(username: string, qRaw: string, onlyRaw = '') {
+    const q = String(qRaw || '').trim().toUpperCase();
+    if (!q) return { ok: false, message: 'Enter a student ID or challan number.', student: null, challans: [] };
+
+    let sdno = q;
+    if (/^\d+[GF]?$/.test(q)) {
+      const num = q.replace(/[GF]$/, '');
+      const found = await this.database.query<{ sdno: string }>(
+        `SELECT coalesce(trim(sdno), '') AS sdno FROM accmast WHERE invno IN ($1, $2) LIMIT 1`,
+        [`${num}G`, `${num}F`],
+      );
+      sdno = found.rows[0]?.sdno || '';
+      if (!sdno) return { ok: false, message: `Challan ${q} not found.`, student: null, challans: [] };
+    }
+
+    const student = await this.database.query<{
+      sdno: string;
+      name: string;
+      fatherName: string;
+      status: string;
+      siteCode: string;
+      campus: string;
+      classCode: string;
+      className: string;
+      sectionName: string;
+    }>(
+      `SELECT trim(st.sdno) AS sdno,
+              coalesce(trim(st.name), '') AS name,
+              coalesce(trim(st.fname), '') AS "fatherName",
+              coalesce(trim(st.stat), '') AS status,
+              coalesce(trim(st.ccode), '') AS "siteCode",
+              coalesce(nullif(trim(camp.ahead), ''), trim(st.ccode), '') AS campus,
+              coalesce(trim(st.class), '') AS "classCode",
+              coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
+              coalesce(nullif(trim(se.ahead), ''), trim(st.sec), '') AS "sectionName"
+       FROM student st
+       LEFT JOIN acc camp ON camp.acode = st.ccode
+       LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = st.sec
+       WHERE st.sdno = $1
+       LIMIT 1`,
+      [sdno],
+    );
+    const info = student.rows[0];
+    if (!info) return { ok: false, message: `Student ${sdno} not found.`, student: null, challans: [] };
+    const zone = await this.zonePrefix(username);
+    if (zone && info.siteCode && !info.siteCode.startsWith(zone)) {
+      return { ok: false, message: 'Student outside your zone.', student: null, challans: [] };
+    }
+
+    const only = String(onlyRaw || '')
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+    const params: unknown[] = [sdno];
+    let onlyClause = '';
+    if (only.length) {
+      params.push(only);
+      onlyClause = `AND m.invno = ANY($2::text[])`;
+    }
+    const rows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      dueDate: string;
+      mont: string;
+      narration: string;
+      siteCode: string;
+      amount: string;
+    }>(
+      `SELECT trim(m.invno) AS invno,
+              left(coalesce(m.invdate, ''), 10) AS invdate,
+              left(coalesce(m.dudate, ''), 10) AS "dueDate",
+              coalesce(trim(m.mont), '') AS mont,
+              coalesce(trim(m.nar), '') AS narration,
+              coalesce(trim(m.ccode), '') AS "siteCode",
+              coalesce(sum(${this.debitSql}), 0)::text AS amount
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       WHERE m.sdno = $1
+         AND m.invno LIKE '%G'
+         AND NOT ${G_PAID_SQL('m')}
+         ${onlyClause}
+       GROUP BY m.invno, m.invdate, m.dudate, m.mont, m.nar, m.ccode
+       HAVING coalesce(sum(${this.debitSql}), 0) > 0
+       ORDER BY right(trim(m.mont), 4) || left(trim(m.mont), 2), m.invno`,
+      params,
+    );
+
+    return {
+      ok: true,
+      student: info,
+      challans: rows.rows.map((r) => ({
+        invno: r.invno,
+        invdate: r.invdate,
+        dueDate: r.dueDate,
+        mont: r.mont,
+        narration: r.narration,
+        siteCode: r.siteCode,
+        amount: round2(Number(r.amount) || 0),
+      })),
+    };
+  }
+
+  /**
+   * Legacy H.F partial payment: for each bill, the G is reduced to the received amount,
+   * a receipt F with the same number is posted, and any remainder becomes a new unpaid G.
+   */
+  async receivePayment(
+    username: string,
+    body: {
+      payDate?: string;
+      bankCode?: string;
+      balanceMode?: string;
+      lines?: Array<{ invno?: string; received?: number | string }>;
+    },
+  ) {
+    const payDate = this.normDate(String(body.payDate || '')) || this.today();
+    const bankCode = String(body.bankCode || '').trim();
+    if (!bankCode.startsWith('1506')) {
+      return { ok: false, message: 'Select a cash / bank account.' };
+    }
+    const carry = String(body.balanceMode || '').trim() === 'carry';
+    const wanted = (Array.isArray(body.lines) ? body.lines : [])
+      .map((l) => ({
+        invno: String(l.invno || '').trim().toUpperCase(),
+        received: round2(Math.max(0, Number(l.received) || 0)),
+      }))
+      .filter((l) => l.invno.endsWith('G') && l.received > 0);
+    if (!wanted.length) return { ok: false, message: 'Enter a received amount on at least one challan.' };
+
+    const zone = await this.zonePrefix(username);
+    const uname = username.trim() || null;
+    const receipts: string[] = [];
+    const balances: Array<{ invno: string; amount: number }> = [];
+    let totalReceived = 0;
+    let sdnoOut = '';
+    let ccodeOut = '';
+
+    const balanceDue = carry ? this.monthEnd(payDate, 1) : this.addDays(payDate, 10);
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        let nextNo = await this.lockFeeSequence(client);
+
+        for (const line of wanted) {
+          const num = line.invno.slice(0, -1);
+          const master = await client.query<{
+            invno: string;
+            nar: string;
+            ccode: string;
+            sdno: string;
+            mont: string;
+            aclas: string;
+            u4: string;
+            studentName: string;
+            className: string;
+          }>(
+            `SELECT trim(m.invno) AS invno,
+                    coalesce(trim(m.nar), '') AS nar,
+                    coalesce(trim(m.ccode), '') AS ccode,
+                    coalesce(trim(m.sdno), '') AS sdno,
+                    coalesce(trim(m.mont), '') AS mont,
+                    coalesce(trim(m.aclas), '') AS aclas,
+                    coalesce(trim(m.u4), '') AS u4,
+                    coalesce(trim(st.name), '') AS "studentName",
+                    coalesce(nullif(trim(cl.ahead), ''), '') AS "className"
+             FROM accmast m
+             LEFT JOIN student st ON st.sdno = m.sdno
+             LEFT JOIN acc cl ON cl.acode = m.aclas
+             WHERE m.invno = $1
+             LIMIT 1
+             FOR UPDATE OF m`,
+            [line.invno],
+          );
+          const g = master.rows[0];
+          if (!g) throw new Error(`Challan ${line.invno} not found.`);
+          if (zone && g.ccode && !g.ccode.startsWith(zone)) {
+            throw new Error(`Challan ${line.invno} is outside your zone.`);
+          }
+          const paid = await client.query(`SELECT 1 FROM accmast WHERE invno = $1 LIMIT 1`, [`${num}F`]);
+          if (paid.rowCount) throw new Error(`Challan ${line.invno} is already paid.`);
+
+          const det = await client.query<{ acode: string; dr: string; cr: string }>(
+            `SELECT trim(acode) AS acode, (${NUM('d', 'dr')})::text AS dr, (${NUM('d', 'cr')})::text AS cr
+             FROM accdet d WHERE d.invno = $1 ORDER BY d.row_id`,
+            [line.invno],
+          );
+          const amount = round2(det.rows.reduce((s, r) => s + (Number(r.dr) || 0), 0));
+          const receivable = det.rows.find((r) => Number(r.dr) > 0)?.acode || g.u4;
+          const income = det.rows.find((r) => Number(r.cr) > 0)?.acode || '';
+          if (!receivable || !income || amount <= 0) {
+            throw new Error(`Challan ${line.invno} has no valid amount lines.`);
+          }
+          if (line.received - amount > 0.005) {
+            throw new Error(`Received on ${line.invno} (${line.received}) is more than the bill (${amount}).`);
+          }
+          const balance = round2(amount - line.received);
+
+          if (balance > 0.005) {
+            await client.query(`UPDATE accdet SET dr = $2 WHERE invno = $1 AND (${NUM('accdet', 'dr')}) > 0`, [
+              line.invno,
+              String(line.received),
+            ]);
+            await client.query(`UPDATE accdet SET cr = $2 WHERE invno = $1 AND (${NUM('accdet', 'cr')}) > 0`, [
+              line.invno,
+              String(line.received),
+            ]);
+
+            nextNo += 1;
+            const balInv = `${String(nextNo).padStart(6, '0')}G`;
+            await client.query(
+              `INSERT INTO accmast
+                 (invno, invdate, nar, ccode, pflag, edate, uname, tflag, u4, sdno, mont, aclas, dudate)
+               VALUES ($1, $2, $3, $4, 'P', $2, $5, '1', $6, $7, $8, $9, $10)`,
+              [
+                balInv,
+                `${payDate} 00:00:00`,
+                `${g.nar.replace(/\s*\(Balance\)$/i, '')} (Balance)`,
+                g.ccode,
+                uname,
+                receivable,
+                g.sdno,
+                g.mont || null,
+                g.aclas || null,
+                `${balanceDue} 00:00:00`,
+              ],
+            );
+            await client.query(
+              `INSERT INTO accdet (invno, acode, dr, cr) VALUES ($1, $2, $3, '0'), ($1, $4, '0', $3)`,
+              [balInv, receivable, String(balance), income],
+            );
+            balances.push({ invno: balInv, amount: balance });
+          }
+
+          const fInv = `${num}F`;
+          const fNar = [g.nar, g.studentName && `Name ${g.studentName}`, g.className && `Class ${g.className}`]
+            .filter(Boolean)
+            .join(' ');
+          await client.query(`UPDATE accmast SET bcode = $2 WHERE invno = $1`, [line.invno, bankCode]);
+          await client.query(
+            `INSERT INTO accmast
+               (invno, invdate, nar, ccode, pflag, edate, uname, tflag, u4, sdno, mont, bcode, aclas)
+             VALUES ($1, $2, $3, $4, 'P', $2, $5, '1', $6, $7, $8, $9, $10)`,
+            [
+              fInv,
+              `${payDate} 00:00:00`,
+              fNar,
+              g.ccode,
+              uname,
+              receivable,
+              g.sdno,
+              g.mont || null,
+              bankCode,
+              g.aclas || null,
+            ],
+          );
+          await client.query(
+            `INSERT INTO accdet (invno, acode, dr, cr) VALUES ($1, $2, $3, '0'), ($1, $4, '0', $3)`,
+            [fInv, bankCode, String(line.received), receivable],
+          );
+          receipts.push(fInv);
+          totalReceived = round2(totalReceived + line.received);
+          sdnoOut = g.sdno;
+          ccodeOut = g.ccode;
+        }
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to receive payment.';
+      return { ok: false, message };
+    }
+
+    const balanceTotal = round2(balances.reduce((s, b) => s + b.amount, 0));
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Fee Payment Received',
+      description: `Received ${totalReceived.toFixed(2)} for ${sdnoOut} (${receipts.join(', ')})${
+        balances.length ? ` · balance ${balanceTotal.toFixed(2)} on ${balances.map((b) => b.invno).join(', ')}` : ''
+      }`,
+      module: 'Fee Control',
+      campus: '',
+      campusCode: ccodeOut,
+      status: 'Success',
+      meta: { sdno: sdnoOut, receipts, balances, carry },
+    });
+
+    return {
+      ok: true,
+      message: balances.length
+        ? `Received ${totalReceived.toFixed(2)}. Balance ${balanceTotal.toFixed(2)} moved to ${balances
+            .map((b) => b.invno)
+            .join(', ')}.`
+        : `Received ${totalReceived.toFixed(2)}.`,
+      sdno: sdnoOut,
+      receipts,
+      balances,
+      balanceTotal,
+      balanceDue,
+    };
+  }
+
+  /**
+   * Serialises fee bill/receipt numbering (G and F share one sequence) for the rest of the
+   * transaction and returns the highest number in use.
+   */
+  private async lockFeeSequence(client: PoolClient) {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('accmast_fee_gf_seq'))`);
+    const seq = await client.query<{ n: string }>(
+      `SELECT coalesce(max(left(invno, length(invno) - 1)::bigint), 0)::text AS n
+       FROM accmast WHERE invno ~ '^[0-9]+[GF]$'`,
+    );
+    return Number(seq.rows[0]?.n || 0);
+  }
+
+  /**
+   * Legacy R.B "Fee Voucher Print Single": bills (…G) for one student and fee month from the
+   * student's fee master. Monthly heads bill once per month, annual heads once per year, and
+   * one-time heads (admission, registration, transfer) once ever — re-running never duplicates.
+   */
+  async generateChallans(username: string, sdnoRaw: string, montRaw = '') {
+    const sdno = String(sdnoRaw || '').trim().toUpperCase();
+    if (!sdno) return { ok: false, message: 'Student ID required.', created: [] };
+    const mont = toYyyymm(montRaw) ? String(montRaw).replace(/\D/g, '') : this.currentMont();
+    const montKey = toYyyymm(mont);
+    const year = montKey.slice(0, 4);
+
+    const st = await this.database.query<{
+      sdno: string;
+      stat: string;
+      ccode: string;
+      cls: string;
+      tfee: string;
+      transfee: string;
+      adfee: string;
+      regfee: string;
+      migfee: string;
+      anualfee: string;
+      sumpack: string;
+    }>(
+      `SELECT trim(sdno) AS sdno, coalesce(trim(stat), '') AS stat, coalesce(trim(ccode), '') AS ccode,
+              coalesce(trim(class), '') AS cls,
+              coalesce(tfee, '') AS tfee, coalesce(transfee, '') AS transfee, coalesce(adfee, '') AS adfee,
+              coalesce(regfee, '') AS regfee, coalesce(migfee, '') AS migfee,
+              coalesce(anualfee, '') AS anualfee, coalesce(sumpack, '') AS sumpack
+       FROM student WHERE sdno = $1 LIMIT 1`,
+      [sdno],
+    );
+    const s = st.rows[0];
+    if (!s) return { ok: false, message: `Student ${sdno} not found.`, created: [] };
+    if (s.stat.toUpperCase() !== 'ACTIVE') {
+      return { ok: false, message: 'Challans are generated for Active students only.', created: [] };
+    }
+    const zone = await this.zonePrefix(username);
+    if (zone && s.ccode && !s.ccode.startsWith(zone)) {
+      return { ok: false, message: 'Student outside your zone.', created: [] };
+    }
+
+    const label = this.montLabel(mont);
+    const heads: Array<{
+      raw: string;
+      recv: string;
+      income: string;
+      nar: string;
+      scope: 'month' | 'year' | 'once';
+    }> = [
+      { raw: s.adfee, recv: '1502010005', income: '310105', nar: `Admission Fee ${mont}`, scope: 'once' },
+      { raw: s.regfee, recv: '1502010007', income: '310107', nar: `Registration Fee ${mont}`, scope: 'once' },
+      { raw: s.migfee, recv: '1502010008', income: '310108', nar: `Migration/Re-addmission Fee ${mont}`, scope: 'once' },
+      { raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year' },
+      { raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year' },
+      { raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
+      { raw: s.transfee, recv: '1502010003', income: '310103', nar: `Van Fee ${label}`, scope: 'month' },
+    ];
+
+    const issue = this.today();
+    const due = this.addDays(issue, 10);
+    const created: Array<{ invno: string; narration: string; amount: number }> = [];
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        let nextNo = await this.lockFeeSequence(client);
+        for (const head of heads) {
+          const amount = round2(Number(String(head.raw).replace(/,/g, '')) || 0);
+          if (amount <= 0) continue;
+          const billed = await client.query(
+            `SELECT 1 FROM accmast m
+             WHERE m.sdno = $1 AND m.invno LIKE '%G' AND trim(m.u4) = $2
+               AND (
+                 $3 = 'once'
+                 OR ($3 = 'year' AND right(trim(m.mont), 4) = $4)
+                 OR ($3 = 'month' AND trim(m.mont) = $5)
+               )
+             LIMIT 1`,
+            [sdno, head.recv, head.scope, year, mont],
+          );
+          if (billed.rowCount) continue;
+
+          nextNo += 1;
+          const invno = `${String(nextNo).padStart(6, '0')}G`;
+          await client.query(
+            `INSERT INTO accmast
+               (invno, invdate, nar, ccode, pflag, edate, uname, tflag, u4, sdno, mont, aclas, dudate)
+             VALUES ($1, $2, $3, $4, 'P', $2, $5, '1', $6, $7, $8, $9, $10)`,
+            [
+              invno,
+              `${issue} 00:00:00`,
+              head.nar,
+              s.ccode || null,
+              username.trim() || null,
+              head.recv,
+              sdno,
+              mont,
+              s.cls || null,
+              `${due} 00:00:00`,
+            ],
+          );
+          await client.query(
+            `INSERT INTO accdet (invno, acode, dr, cr) VALUES ($1, $2, $3, '0'), ($1, $4, '0', $3)`,
+            [invno, head.recv, String(amount), head.income],
+          );
+          created.push({ invno, narration: head.nar, amount });
+        }
+      });
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : 'Failed to generate challans.', created: [] };
+    }
+
+    if (created.length) {
+      await this.activityLog.write({
+        category: 'activity',
+        username: username || 'Unknown',
+        activity: 'Fee Challan Generated',
+        description: `Generated ${created.length} challan(s) for ${sdno} ${mont}: ${created
+          .map((c) => `${c.invno} ${c.amount}`)
+          .join(', ')}`,
+        module: 'Fee Control',
+        campus: '',
+        campusCode: s.ccode,
+        status: 'Success',
+        meta: { sdno, mont, created },
+      });
+    }
+    return { ok: true, message: `${created.length} challan(s) generated.`, mont, created };
+  }
+
+  /** Total of unpaid fee bills per student, for the Students Register "Pending" column. */
+  async studentDues(sdnosRaw: string) {
+    const sdnos = String(sdnosRaw || '')
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+      .slice(0, 200);
+    if (!sdnos.length) return { dues: {} as Record<string, { amount: number; count: number }> };
+    const rows = await this.database.query<{ sdno: string; amount: string; n: string }>(
+      `SELECT trim(m.sdno) AS sdno, coalesce(sum(${this.debitSql}), 0)::text AS amount,
+              count(DISTINCT m.invno)::text AS n
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       WHERE m.sdno = ANY($1::text[])
+         AND m.invno LIKE '%G'
+         AND NOT ${G_PAID_SQL('m')}
+       GROUP BY trim(m.sdno)`,
+      [sdnos],
+    );
+    const dues: Record<string, { amount: number; count: number }> = {};
+    for (const r of rows.rows) {
+      const amount = round2(Number(r.amount) || 0);
+      if (amount > 0) dues[r.sdno] = { amount, count: Number(r.n) || 0 };
+    }
+    return { dues };
+  }
+
   async logReport(
     username: string,
     report: string,
@@ -2101,6 +2590,30 @@ export class FinancialControlService {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
     return `${y}-${m}-01`;
+  }
+
+  /** Fee month as stored in accmast.mont (MMYYYY). */
+  private currentMont() {
+    const d = new Date();
+    return `${String(d.getMonth() + 1).padStart(2, '0')}${d.getFullYear()}`;
+  }
+
+  /** MMYYYY → "oct-2026", the legacy narration style. */
+  private montLabel(mont: string) {
+    const names = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    return `${names[Number(mont.slice(0, 2)) - 1] || mont.slice(0, 2)}-${mont.slice(2)}`;
+  }
+
+  private addDays(ymd: string, days: number) {
+    const d = new Date(`${ymd}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+  }
+
+  /** Last day of the month `offset` months after `ymd`. */
+  private monthEnd(ymd: string, offset = 0) {
+    const d = new Date(`${ymd}T00:00:00Z`);
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + offset + 1, 0)).toISOString().slice(0, 10);
   }
 
   private nextDay(ymd: string) {
