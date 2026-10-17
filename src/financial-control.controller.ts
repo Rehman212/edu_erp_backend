@@ -196,6 +196,7 @@ export class FinancialControlController {
       Number(pageSize) || 50,
       status ?? 'ALL',
       colFiltersFrom(all),
+      all?.q ?? '',
     );
   }
 
@@ -250,6 +251,7 @@ export class FinancialControlController {
       montFrom ?? '',
       montTo ?? '',
       colFiltersFrom(all),
+      all?.q ?? '',
     );
   }
 

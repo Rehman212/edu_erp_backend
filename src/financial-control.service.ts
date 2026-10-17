@@ -938,6 +938,18 @@ export class FinancialControlService {
     };
   }
 
+  /** Student ID / name / challan no / narration search across the whole period. */
+  private feeSearchSql(q: string, params: unknown[]) {
+    const term = String(q || '').trim();
+    if (!term) return '';
+    params.push(`%${term}%`);
+    const p = `$${params.length}`;
+    return `AND (m.invno ILIKE ${p}
+           OR coalesce(m.sdno, '') ILIKE ${p}
+           OR coalesce(m.nar, '') ILIKE ${p}
+           OR EXISTS (SELECT 1 FROM student sq WHERE sq.sdno = m.sdno AND sq.name ILIKE ${p}))`;
+  }
+
   async feeCollection(
     username: string,
     site: string,
@@ -949,6 +961,7 @@ export class FinancialControlService {
     pageSize = 50,
     status = 'ALL',
     colFilters: Record<string, string> = {},
+    q = '',
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -982,24 +995,29 @@ export class FinancialControlService {
       : '';
     const params: unknown[] = [from, toExclusive, scope, fromKey, toKey];
     if (statusDb) params.push(statusDb);
+    const searchFilter = this.feeSearchSql(q, params);
     const baseWhere = `right(m.invno, 1) = 'F'
          AND m.invdate >= $1 AND m.invdate < $2
          AND ($3 = '' OR m.ccode LIKE $3 || '%')
          AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
          AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-         ${statusFilter}`;
+         ${statusFilter}
+         ${searchFilter}`;
     const baseSql = `SELECT m.invno AS invno,
               left(m.invdate, 10) AS invdate,
               coalesce(m.nar, '') AS narr,
               coalesce(m.ccode, '') AS "siteCode",
               coalesce(nullif(trim(s.ahead), ''), m.ccode, '') AS "siteName",
               coalesce(m.mont, '') AS mont,
+              coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+              coalesce(nullif(trim(st.name), ''), '') AS "studentName",
               coalesce(sum(${this.debitSql}), 0) AS amount
        FROM accmast m
        JOIN accdet d ON d.invno = m.invno
        LEFT JOIN acc s ON s.acode = m.ccode
+       LEFT JOIN student st ON st.sdno = m.sdno
        WHERE ${baseWhere}
-       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont`;
+       GROUP BY m.invno, m.invdate, m.nar, m.ccode, s.ahead, m.mont, m.sdno, st.name`;
 
     const options =
       current === 1 ? await this.feeVoucherOptions(baseWhere, [...params]) : undefined;
@@ -1019,10 +1037,13 @@ export class FinancialControlService {
       siteCode: string;
       siteName: string;
       mont: string;
+      sdno: string;
+      studentName: string;
       amount: string;
     }>(
       `WITH base AS (${baseSql})
-       SELECT b.invno, b.invdate, b.narr, b."siteCode", b."siteName", b.mont, b.amount::text AS amount
+       SELECT b.invno, b.invdate, b.narr, b."siteCode", b."siteName", b.mont, b.sdno, b."studentName",
+              b.amount::text AS amount
        FROM base b ${colWhere}
        ORDER BY b.invdate DESC, b.invno DESC
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -1038,6 +1059,8 @@ export class FinancialControlService {
         siteCode: r.siteCode,
         siteName: r.siteName,
         mont: r.mont,
+        sdno: r.sdno,
+        studentName: r.studentName,
         amount: round2(Number(r.amount) || 0),
       })),
       total: Number(count.rows[0]?.total) || 0,
@@ -1214,6 +1237,7 @@ export class FinancialControlService {
     montFrom = '',
     montTo = '',
     colFilters: Record<string, string> = {},
+    q = '',
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -1247,13 +1271,15 @@ export class FinancialControlService {
         WHERE st.sdno = m.sdno AND trim(st.stat) = $${params.length}
       )`;
     }
+    const searchFilter = this.feeSearchSql(q, params);
 
     const baseWhere = `right(trim(m.invno), 1) = 'G'
          AND m.invdate >= $1 AND m.invdate < $2
          AND ($3 = '' OR m.ccode LIKE $3 || '%')
          AND ($4 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} >= $4))
          AND ($5 = '' OR (length(trim(coalesce(m.mont,''))) >= 6 AND ${montExpr} <= $5))
-         ${statusFilter}`;
+         ${statusFilter}
+         ${searchFilter}`;
     const baseSql = `SELECT trim(m.invno) AS invno,
               left(m.invdate, 10) AS invdate,
               coalesce(m.nar, '') AS narr,
