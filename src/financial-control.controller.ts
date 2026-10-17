@@ -224,6 +224,7 @@ export class FinancialControlController {
       montFrom ?? '',
       montTo ?? '',
       colFiltersFrom(all),
+      all?.sort ?? '',
     );
   }
 
@@ -302,6 +303,7 @@ export class FinancialControlController {
       montFrom ?? '',
       montTo ?? '',
       colFiltersFrom(all),
+      all?.sort ?? '',
     );
   }
 

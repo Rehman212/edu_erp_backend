@@ -42,6 +42,7 @@ type DefaulterOut = {
   sdno: string;
   name: string;
   status: string;
+  classCode?: string;
   className?: string;
   sectionName?: string;
   campus: string;
@@ -73,9 +74,11 @@ const DEFAULTER_COLS = {
 } as const;
 
 function defaulterOptions(rows: DefaulterOut[]) {
+  const classes = new Map<string, string>();
+  for (const r of rows) if (r.className && !classes.has(r.className)) classes.set(r.className, r.classCode || '');
   return {
     campus: distinctSorted(rows.map((r) => r.campus)),
-    className: distinctSorted(rows.map((r) => r.className)),
+    className: [...classes.entries()].sort((a, b) => a[1].localeCompare(b[1])).map(([name]) => name),
     sectionName: distinctSorted(rows.map((r) => r.sectionName)),
     status: distinctSorted(rows.map((r) => r.status)),
     bankName: distinctSorted(rows.map((r) => r.bankName)),
@@ -94,11 +97,19 @@ export class FinancialControlService {
 
   /** Lexicographic range on text invdate ('YYYY-MM-DD …'). toExclusive = day after toDate. */
   /** Replace class codes with class names and add section names from the student record. */
-  private async withClassSection<T extends { sdno: string; className?: string; sectionName?: string }>(rows: T[]) {
+  private async withClassSection<
+    T extends { sdno: string; className?: string; sectionName?: string; classCode?: string },
+  >(rows: T[]) {
     const sdnos = [...new Set(rows.map((r) => r.sdno).filter(Boolean))];
     if (!sdnos.length) return rows;
-    const info = await this.database.query<{ sdno: string; className: string; sectionName: string }>(
+    const info = await this.database.query<{
+      sdno: string;
+      classCode: string;
+      className: string;
+      sectionName: string;
+    }>(
       `SELECT trim(st.sdno) AS sdno,
+              coalesce(trim(st.class), '') AS "classCode",
               coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
               coalesce(nullif(trim(se.ahead), ''), '') AS "sectionName"
        FROM student st
@@ -110,10 +121,25 @@ export class FinancialControlService {
     const bySdno = new Map(info.rows.map((r) => [r.sdno, r]));
     for (const row of rows) {
       const hit = bySdno.get(row.sdno);
+      row.classCode = hit?.classCode || row.className || '';
       row.className = hit?.className || row.className || '';
       row.sectionName = hit?.sectionName || '';
     }
     return rows;
+  }
+
+  /** "class": class (school order) → section → highest outstanding; default: highest outstanding. */
+  private sortDefaulters<T extends { classCode?: string; sectionName?: string; outstanding: number }>(
+    rows: T[],
+    sort: string,
+  ) {
+    if (sort !== 'class') return rows;
+    return [...rows].sort(
+      (a, b) =>
+        (a.classCode || '~').localeCompare(b.classCode || '~') ||
+        (a.sectionName || '~').localeCompare(b.sectionName || '~', undefined, { sensitivity: 'base' }) ||
+        b.outstanding - a.outstanding,
+    );
   }
 
   private periodBounds(fromDate: string, toDate: string) {
@@ -1121,6 +1147,7 @@ export class FinancialControlService {
     montFrom = '',
     montTo = '',
     colFilters: Record<string, string> = {},
+    sort = '',
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -1227,10 +1254,11 @@ export class FinancialControlService {
         credit: round2(credit),
         outstanding: round2(debit - credit),
         sectionName: '',
+        classCode: '',
       };
     });
     await this.withClassSection(mapped);
-    const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
+    const filtered = this.sortDefaulters(filterInMemory(mapped, colFilters, DEFAULTER_COLS), sort);
     const slice = filtered.slice(offset, offset + size);
     const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
 
@@ -1511,6 +1539,7 @@ export class FinancialControlService {
         credit: round2(credit),
         outstanding: round2(debit - credit),
         sectionName: '',
+        classCode: '',
       };
     });
     await this.withClassSection(mapped);
@@ -1547,6 +1576,7 @@ export class FinancialControlService {
     montFrom = '',
     montTo = '',
     colFilters: Record<string, string> = {},
+    sort = '',
   ) {
     const scope = await this.siteScope(username, site);
     const fromKey = toYyyymm(montFrom);
@@ -1683,10 +1713,11 @@ export class FinancialControlService {
         credit: round2(credit),
         outstanding: round2(debit - credit),
         sectionName: '',
+        classCode: '',
       };
     });
     await this.withClassSection(mapped);
-    const filtered = filterInMemory(mapped, colFilters, DEFAULTER_COLS);
+    const filtered = this.sortDefaulters(filterInMemory(mapped, colFilters, DEFAULTER_COLS), sort);
     const slice = filtered.slice(offset, offset + size);
     const totalOutstanding = filtered.reduce((s, r) => s + r.outstanding, 0);
 
