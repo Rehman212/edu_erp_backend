@@ -264,6 +264,8 @@ export class RegistrationService implements OnModuleInit {
       const variants = new Set<string>([rawQ]);
       if (/ahmed/i.test(rawQ)) variants.add(rawQ.replace(/ahmed/gi, 'Ahmad'));
       if (/ahmad/i.test(rawQ)) variants.add(rawQ.replace(/ahmad/gi, 'Ahmed'));
+      const intl = rawQ.replace(/[\s-]/g, '').match(/^\+?92(\d{6,})$/);
+      if (intl) variants.add(`0${intl[1]}`);
       const qParts: string[] = [];
       for (const v of variants) {
         params.push(`%${v}%`);
@@ -273,7 +275,25 @@ export class RegistrationService implements OnModuleInit {
             OR st.rollno ILIKE $${i}
             OR st.name ILIKE $${i}
             OR st.fname ILIKE $${i}
-            OR st.cellno ILIKE $${i})`,
+            OR st.mname ILIKE $${i}
+            OR st.gaurdian ILIKE $${i}
+            OR st.cellno ILIKE $${i}
+            OR st.rphone ILIKE $${i}
+            OR st.ophone ILIKE $${i}
+            OR st.whatsapp ILIKE $${i}
+            OR st.fnic ILIKE $${i}
+            OR st.mnic ILIKE $${i}
+            OR st.paddress ILIKE $${i}
+            OR st.remarks ILIKE $${i}
+            OR st.stat ILIKE $${i}
+            OR st.atyp ILIKE $${i}
+            OR st.adate::text ILIKE $${i}
+            OR c.ahead ILIKE $${i}
+            OR cl.ahead ILIKE $${i}
+            OR se.ahead ILIKE $${i}
+            OR st.adfee ILIKE $${i}
+            OR st.tfee ILIKE $${i}
+            OR st.transfee ILIKE $${i})`,
         );
       }
       where.push(`(${qParts.join(' OR ')})`);
