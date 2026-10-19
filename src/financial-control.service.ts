@@ -2109,8 +2109,8 @@ export class FinancialControlService {
    * Unpaid fee bills (…G without a matching …F) for one student.
    * `q` is a student ID or any challan number of that student (e.g. 386569G / 386569).
    */
-  async studentChallans(username: string, qRaw: string, onlyRaw = '') {
-    const found = await this.findChallanStudent(username, qRaw);
+  async studentChallans(username: string, qRaw: string, onlyRaw = '', site = '') {
+    const found = await this.findChallanStudent(username, qRaw, site);
     if (!found.info) return { ok: false, message: found.message, student: null, challans: [] };
     const info = found.info;
     const sdno = info.sdno;
@@ -2169,8 +2169,8 @@ export class FinancialControlService {
   }
 
   /** Every fee bill of one student (all months) with its paid status and receipt. */
-  async studentLedger(username: string, qRaw: string) {
-    const found = await this.findChallanStudent(username, qRaw);
+  async studentLedger(username: string, qRaw: string, site = '') {
+    const found = await this.findChallanStudent(username, qRaw, site);
     if (!found.info) return { ok: false, message: found.message, student: null, rows: [] };
     const rows = await this.database.query<{
       invno: string;
@@ -2252,12 +2252,40 @@ export class FinancialControlService {
     };
   }
 
-  private async findChallanStudent(username: string, qRaw: string) {
+  /**
+   * Short IDs (1–5 digits, optional S) expand to zone + 5-digit serial + S, e.g. "6406" under SRA →
+   * 140106406S, the same way Student Registration search finds them.
+   */
+  private async findShortStudentId(username: string, site: string, serial: string) {
+    const zone = await this.zonePrefix(username);
+    const picked = String(site || '').trim().slice(0, 4);
+    const zones = /^14(01|02|03)$/.test(picked) && (!zone || picked.startsWith(zone.slice(0, 4)))
+      ? [picked]
+      : zone
+        ? [zone.slice(0, 4)]
+        : ['1401', '1402', '1403'];
+    const ids = zones.map((z) => `${z}${serial.padStart(5, '0')}S`);
+    const st = await this.database.query<{ sdno: string }>(
+      `SELECT trim(sdno) AS sdno FROM student WHERE sdno = ANY($1::text[])`,
+      [ids],
+    );
+    return st.rows.map((r) => r.sdno);
+  }
+
+  private async findChallanStudent(username: string, qRaw: string, site = '') {
     const q = String(qRaw || '').trim().toUpperCase();
     if (!q) return { info: null, message: 'Enter a student ID or challan number.' };
 
     let sdno = q;
-    if (/^\d+[GF]?$/.test(q)) {
+    const short = /^(\d{1,5})S?$/.exec(q);
+    if (short) {
+      const ids = await this.findShortStudentId(username, site, short[1]);
+      if (ids.length > 1) {
+        return { info: null, message: `More than one student matches ${q} (${ids.join(', ')}). Select a zone first.` };
+      }
+      if (ids.length === 1) sdno = ids[0];
+    }
+    if (sdno === q && /^\d+[GF]?$/.test(q)) {
       const num = q.replace(/[GF]$/, '');
       const found = await this.database.query<{ sdno: string }>(
         `SELECT coalesce(trim(sdno), '') AS sdno FROM accmast WHERE invno IN ($1, $2) LIMIT 1`,

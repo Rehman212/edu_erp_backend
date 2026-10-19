@@ -368,8 +368,9 @@ export class FinancialControlController {
     @Headers('x-ess-user') user: string | undefined,
     @Query('q') q?: string,
     @Query('only') only?: string,
+    @Query('site') site?: string,
   ) {
-    return this.finance.studentChallans(user ?? '', q ?? '', only ?? '');
+    return this.finance.studentChallans(user ?? '', q ?? '', only ?? '', site ?? '');
   }
 
   @Post('generate-challans')
@@ -410,8 +411,12 @@ export class FinancialControlController {
   }
 
   @Get('student-ledger')
-  studentLedger(@Headers('x-ess-user') user: string | undefined, @Query('q') q?: string) {
-    return this.finance.studentLedger(user ?? '', q ?? '');
+  studentLedger(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('q') q?: string,
+    @Query('site') site?: string,
+  ) {
+    return this.finance.studentLedger(user ?? '', q ?? '', site ?? '');
   }
 
   @Delete('voucher')
