@@ -23,6 +23,8 @@ import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
 import { SettingsController } from './settings.controller';
 import { SettingsService } from './settings.service';
+import { FeeIncrementController } from './fee-increment.controller';
+import { FeeIncrementService } from './fee-increment.service';
 @Module({
   imports: [],
   controllers: [
@@ -38,6 +40,7 @@ import { SettingsService } from './settings.service';
     UsersController,
     ActivityLogController,
     SettingsController,
+    FeeIncrementController,
   ],
   providers: [
     AppService,
@@ -52,6 +55,7 @@ import { SettingsService } from './settings.service';
     CampusSetupService,
     UsersService,
     SettingsService,
+    FeeIncrementService,
   ],
 })
 export class AppModule {}

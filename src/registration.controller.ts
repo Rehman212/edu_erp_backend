@@ -36,6 +36,22 @@ export class RegistrationController {
     return this.registration.scopeCounts(user ?? '', site ?? '');
   }
 
+  @Post('class-change')
+  classChange(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body()
+    body: {
+      site?: string;
+      fromClass?: string;
+      fromSection?: string;
+      toClass?: string;
+      toSection?: string;
+      sdnos?: string[];
+    },
+  ) {
+    return this.registration.moveClassSection(user ?? '', body || {});
+  }
+
   @Get('students')
   students(
     @Headers('x-ess-user') user: string | undefined,

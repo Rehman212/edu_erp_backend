@@ -90,6 +90,76 @@ export class RegistrationService implements OnModuleInit {
     return rows.rows;
   }
 
+  /** Bulk move active students of one campus from a class/section to another. */
+  async moveClassSection(
+    username: string,
+    body: {
+      site?: string;
+      fromClass?: string;
+      fromSection?: string;
+      toClass?: string;
+      toSection?: string;
+      sdnos?: unknown;
+    },
+  ) {
+    const site = String(body.site || '').trim();
+    const fromClass = String(body.fromClass || '').trim();
+    const fromSection = String(body.fromSection || '').trim();
+    const toClass = String(body.toClass || '').trim();
+    const toSection = String(body.toSection || '').trim();
+    const sdnos = (Array.isArray(body.sdnos) ? body.sdnos : [])
+      .map((s) => String(s || '').trim())
+      .filter(Boolean);
+
+    if (!isLeafCampus(site)) return { ok: false, message: 'Select a campus first.' };
+    const scope = await this.siteScope(username, site);
+    if (scope !== site) return { ok: false, message: 'This campus is outside your zone.' };
+    const classRe = /^1301(01|02|03)\d{4}$/;
+    const sectionRe = /^130104\d{4}$/;
+    if (!/^1301(01|02|03)(\d{4})?$/.test(fromClass) || !sectionRe.test(fromSection)) {
+      return { ok: false, message: 'Select the old class and section.' };
+    }
+    if (!classRe.test(toClass) || !sectionRe.test(toSection)) {
+      return { ok: false, message: 'Select the new class and section.' };
+    }
+    if (fromClass === toClass && fromSection === toSection) {
+      return { ok: false, message: 'New class / section is the same as the old one.' };
+    }
+    if (!sdnos.length) return { ok: false, message: 'Select at least one student.' };
+    if (sdnos.length > 2000) return { ok: false, message: 'Too many students in one move.' };
+
+    const known = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM acc WHERE trim(acode) IN ($1, $2)`,
+      [toClass, toSection],
+    );
+    if (Number(known.rows[0]?.n) < 2) {
+      return { ok: false, message: 'New class or section does not exist.' };
+    }
+
+    const result = await this.database.query<{ sdno: string }>(
+      `UPDATE student
+          SET class = $1, sec = $2, sect = $2
+        WHERE trim(ccode) = $3
+          AND trim(class) = $4
+          AND coalesce(nullif(trim(sec), ''), trim(sect)) = $5
+          AND upper(trim(coalesce(stat, ''))) = 'ACTIVE'
+          AND trim(sdno) = ANY($6::text[])
+        RETURNING trim(sdno) AS sdno`,
+      [toClass, toSection, site, fromClass, fromSection, sdnos],
+    );
+    const moved = result.rows.map((r) => r.sdno);
+    if (!moved.length) {
+      return { ok: false, message: 'No matching active students found to move.', moved: 0 };
+    }
+    return {
+      ok: true,
+      moved: moved.length,
+      skipped: sdnos.length - moved.length,
+      sdnos: moved,
+      message: `${moved.length} student(s) moved.`,
+    };
+  }
+
   async lookups(username: string, site = '') {
     const [sites, classes, sections] = await Promise.all([
       this.sites(username, site),
