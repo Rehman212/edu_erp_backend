@@ -2670,7 +2670,8 @@ export class FinancialControlService {
   async generateChallans(username: string, sdnoRaw: string, montRaw = '') {
     const sdno = String(sdnoRaw || '').trim().toUpperCase();
     if (!sdno) return { ok: false, message: 'Student ID required.', created: [] };
-    const mont = toYyyymm(montRaw) ? String(montRaw).replace(/\D/g, '') : this.currentMont();
+    const rawKey = toYyyymm(montRaw);
+    const mont = rawKey ? `${rawKey.slice(4)}${rawKey.slice(0, 4)}` : this.currentMont();
     const montKey = toYyyymm(mont);
     const year = montKey.slice(0, 4);
 
@@ -2686,9 +2687,10 @@ export class FinancialControlService {
       migfee: string;
       anualfee: string;
       sumpack: string;
+      adate: string;
     }>(
       `SELECT trim(sdno) AS sdno, coalesce(trim(stat), '') AS stat, coalesce(trim(ccode), '') AS ccode,
-              coalesce(trim(class), '') AS cls,
+              coalesce(trim(class), '') AS cls, left(coalesce(adate::text, ''), 10) AS adate,
               coalesce(tfee, '') AS tfee, coalesce(transfee, '') AS transfee, coalesce(adfee, '') AS adfee,
               coalesce(regfee, '') AS regfee, coalesce(migfee, '') AS migfee,
               coalesce(anualfee, '') AS anualfee, coalesce(sumpack, '') AS sumpack
@@ -2704,26 +2706,35 @@ export class FinancialControlService {
     if (zone && s.ccode && !s.ccode.startsWith(zone)) {
       return { ok: false, message: 'Student outside your zone.', created: [] };
     }
+    const admissionKey = /^\d{4}-\d{2}-\d{2}$/.test(s.adate) ? s.adate.slice(0, 4) + s.adate.slice(5, 7) : '';
+    if (admissionKey && montKey < admissionKey) {
+      return { ok: true, message: 'Month is before admission.', mont, created: [], beforeAdmission: true };
+    }
 
     const label = this.montLabel(mont);
+    // Yearly heads follow the legacy billing month (Annual Fund in March, Summer Pack in June),
+    // or the admission month for a student who joins mid-year.
     const heads: Array<{
       raw: string;
       recv: string;
       income: string;
       nar: string;
       scope: 'month' | 'year' | 'once';
+      billMonth?: string;
     }> = [
       { raw: s.adfee, recv: '1502010005', income: '310105', nar: `Admission Fee ${mont}`, scope: 'once' },
       { raw: s.regfee, recv: '1502010007', income: '310107', nar: `Registration Fee ${mont}`, scope: 'once' },
       { raw: s.migfee, recv: '1502010008', income: '310108', nar: `Migration/Re-addmission Fee ${mont}`, scope: 'once' },
-      { raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year' },
-      { raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year' },
+      { raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year', billMonth: '03' },
+      { raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year', billMonth: '06' },
       { raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
       { raw: s.transfee, recv: '1502010003', income: '310103', nar: `Van Fee ${label}`, scope: 'month' },
     ];
 
     const issue = this.today();
-    const due = this.addDays(issue, 10);
+    const soonest = this.addDays(issue, 10);
+    const monthDue = `${year}-${montKey.slice(4)}-10`;
+    const due = monthDue > soonest ? monthDue : soonest;
     const created: Array<{ invno: string; narration: string; amount: number }> = [];
 
     try {
@@ -2732,6 +2743,7 @@ export class FinancialControlService {
         for (const head of heads) {
           const amount = round2(Number(String(head.raw).replace(/,/g, '')) || 0);
           if (amount <= 0) continue;
+          if (head.scope === 'year' && montKey.slice(4) !== head.billMonth && montKey !== admissionKey) continue;
           const billed = await client.query(
             `SELECT 1 FROM accmast m
              WHERE m.sdno = $1 AND m.invno LIKE '%G' AND trim(m.u4) = $2
