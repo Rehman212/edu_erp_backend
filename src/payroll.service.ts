@@ -944,6 +944,7 @@ export class PayrollService {
                  coalesce(nullif(trim(m.zcode), ''), coalesce(trim(d.stcode), '')) AS "siteCode",
                  trim(m.mont) AS month,
                  left(coalesce(d.fdate::text, ${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "rowDate",
+                 left(coalesce(${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "joinDate",
                  coalesce(nullif(trim(d.salary), ''), nullif(trim(m.mbsal), ''), '0') AS basic,
                  coalesce(nullif(trim(d.spall), ''), '0') AS spall,
                  coalesce(nullif(trim(d.mess), ''), '0') AS mess,
@@ -976,6 +977,7 @@ export class PayrollService {
                  ${pc.site ? `coalesce(trim(p.${pc.site}), '')` : `''`} AS "siteCode",
                  $1::text AS month,
                  left(coalesce(${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "rowDate",
+                 left(coalesce(${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "joinDate",
                  ${pc.salary ? `coalesce(p.${pc.salary}::text, '0')` : `'0'`} AS basic,
                  '0' AS spall,
                  '0' AS mess,
@@ -1011,6 +1013,7 @@ export class PayrollService {
           siteCode: string;
           month: string;
           rowDate: string;
+          joinDate: string;
           basic: string;
           spall: string;
           mess: string;
@@ -1065,7 +1068,7 @@ export class PayrollService {
             campus: r.siteCode || '',
             month: r.month || period,
             date: r.rowDate || '',
-            joinDate: r.rowDate || '',
+            joinDate: r.joinDate || '',
             basic,
             allowances,
             deductions,
