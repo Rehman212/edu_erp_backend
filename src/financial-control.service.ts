@@ -2800,7 +2800,21 @@ export class FinancialControlService {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean)
       .slice(0, 200);
-    if (!sdnos.length) return { dues: {} as Record<string, { amount: number; count: number }> };
+    const mont = this.currentMont();
+    const month = this.montLabel(mont);
+    const vouchers: Record<string, { count: number; unpaid: number }> = {};
+    if (!sdnos.length) return { dues: {} as Record<string, { amount: number; count: number }>, mont, month, vouchers };
+    const monthRows = await this.database.query<{ sdno: string; n: string; unpaid: string }>(
+      `SELECT trim(m.sdno) AS sdno, count(*)::text AS n,
+              count(*) FILTER (WHERE NOT ${G_PAID_SQL('m')})::text AS unpaid
+       FROM accmast m
+       WHERE m.sdno = ANY($1::text[]) AND m.invno LIKE '%G' AND trim(m.mont) = $2
+       GROUP BY trim(m.sdno)`,
+      [sdnos, mont],
+    );
+    for (const r of monthRows.rows) {
+      vouchers[r.sdno] = { count: Number(r.n) || 0, unpaid: Number(r.unpaid) || 0 };
+    }
     const rows = await this.database.query<{ sdno: string; amount: string; n: string }>(
       `SELECT trim(m.sdno) AS sdno, coalesce(sum(${this.debitSql}), 0)::text AS amount,
               count(DISTINCT m.invno)::text AS n
@@ -2817,7 +2831,7 @@ export class FinancialControlService {
       const amount = round2(Number(r.amount) || 0);
       if (amount > 0) dues[r.sdno] = { amount, count: Number(r.n) || 0 };
     }
-    return { dues };
+    return { dues, mont, month, vouchers };
   }
 
   async logReport(
