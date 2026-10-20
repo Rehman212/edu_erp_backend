@@ -376,9 +376,17 @@ export class FinancialControlController {
   @Post('generate-challans')
   generateChallans(
     @Headers('x-ess-user') user: string | undefined,
-    @Body() body: { sdno?: string; mont?: string },
+    @Body()
+    body: { sdno?: string; mont?: string; dueDate?: string; heads?: string[]; fine?: number },
   ) {
-    return this.finance.generateChallans(user ?? '', body?.sdno ?? '', body?.mont ?? '');
+    return this.finance.generateChallans(
+      user ?? '',
+      body?.sdno ?? '',
+      body?.mont ?? '',
+      body?.dueDate ?? '',
+      body?.heads ?? [],
+      body?.fine ?? 0,
+    );
   }
 
   @Get('student-dues')

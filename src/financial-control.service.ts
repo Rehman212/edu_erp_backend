@@ -2667,7 +2667,14 @@ export class FinancialControlService {
    * student's fee master. Monthly heads bill once per month, annual heads once per year, and
    * one-time heads (admission, registration, transfer) once ever — re-running never duplicates.
    */
-  async generateChallans(username: string, sdnoRaw: string, montRaw = '') {
+  async generateChallans(
+    username: string,
+    sdnoRaw: string,
+    montRaw = '',
+    dueRaw = '',
+    headsRaw: unknown = [],
+    fineRaw: unknown = 0,
+  ) {
     const sdno = String(sdnoRaw || '').trim().toUpperCase();
     if (!sdno) return { ok: false, message: 'Student ID required.', created: [] };
     const rawKey = toYyyymm(montRaw);
@@ -2712,9 +2719,17 @@ export class FinancialControlService {
     }
 
     const label = this.montLabel(mont);
+    const picked = (Array.isArray(headsRaw) ? headsRaw : [])
+      .map((h) => String(h || '').trim().toLowerCase())
+      .filter(Boolean);
+    const want = (id: string) => !picked.length || picked.includes(id);
+    const monthMm = montKey.slice(4);
+    const summerBreak = monthMm === '06' || monthMm === '07' || monthMm === '08';
+    const fineAmt = round2(Number(fineRaw) || 0);
     // Yearly heads follow the legacy billing month (Annual Fund in March, Summer Pack in June),
-    // or the admission month for a student who joins mid-year.
+    // or the admission month for a student who joins mid-year. Van is skipped in Jun–Aug.
     const heads: Array<{
+      id: string;
       raw: string;
       recv: string;
       income: string;
@@ -2722,25 +2737,38 @@ export class FinancialControlService {
       scope: 'month' | 'year' | 'once';
       billMonth?: string;
     }> = [
-      { raw: s.adfee, recv: '1502010005', income: '310105', nar: `Admission Fee ${mont}`, scope: 'once' },
-      { raw: s.regfee, recv: '1502010007', income: '310107', nar: `Registration Fee ${mont}`, scope: 'once' },
-      { raw: s.migfee, recv: '1502010008', income: '310108', nar: `Migration/Re-addmission Fee ${mont}`, scope: 'once' },
-      { raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year', billMonth: '03' },
-      { raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year', billMonth: '06' },
-      { raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
-      { raw: s.transfee, recv: '1502010003', income: '310103', nar: `Van Fee ${label}`, scope: 'month' },
+      { id: 'admission', raw: s.adfee, recv: '1502010005', income: '310105', nar: `Admission Fee ${mont}`, scope: 'once' },
+      { id: 'registration', raw: s.regfee, recv: '1502010007', income: '310107', nar: `Registration Fee ${mont}`, scope: 'once' },
+      { id: 'transfer', raw: s.migfee, recv: '1502010008', income: '310108', nar: `Migration/Re-addmission Fee ${mont}`, scope: 'once' },
+      { id: 'annual', raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year', billMonth: '03' },
+      { id: 'summer', raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year', billMonth: '06' },
+      { id: 'tuition', raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
+      { id: 'van', raw: s.transfee, recv: '1502010003', income: '310103', nar: `Van Fee ${label}`, scope: 'month' },
     ];
+    if (want('fine') && fineAmt > 0) {
+      heads.push({
+        id: 'fine',
+        raw: String(fineAmt),
+        recv: '1502010010',
+        income: '310110',
+        nar: `Fine ${label}`,
+        scope: 'month',
+      });
+    }
 
     const issue = this.today();
     const soonest = this.addDays(issue, 10);
     const monthDue = `${year}-${montKey.slice(4)}-10`;
-    const due = monthDue > soonest ? monthDue : soonest;
+    const customDue = /^\d{4}-\d{2}-\d{2}$/.test(String(dueRaw || '').trim()) ? String(dueRaw).trim() : '';
+    const due = customDue || (monthDue > soonest ? monthDue : soonest);
     const created: Array<{ invno: string; narration: string; amount: number }> = [];
 
     try {
       await this.database.withTransaction(async (client) => {
         let nextNo = await this.lockFeeSequence(client);
         for (const head of heads) {
+          if (!want(head.id)) continue;
+          if (head.id === 'van' && summerBreak) continue;
           const amount = round2(Number(String(head.raw).replace(/,/g, '')) || 0);
           if (amount <= 0) continue;
           if (head.scope === 'year' && montKey.slice(4) !== head.billMonth && montKey !== admissionKey) continue;
