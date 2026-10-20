@@ -2810,6 +2810,16 @@ export class FinancialControlService {
           );
           created.push({ invno, narration: head.nar, amount });
         }
+        if (customDue) {
+          await client.query(
+            `UPDATE accmast m
+                SET dudate = $2
+              WHERE trim(m.sdno) = $1
+                AND m.invno LIKE '%G'
+                AND NOT ${G_PAID_SQL('m')}`,
+            [sdno, `${customDue} 00:00:00`],
+          );
+        }
       });
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Failed to generate challans.', created: [] };
