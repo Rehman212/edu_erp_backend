@@ -2851,19 +2851,33 @@ export class FinancialControlService {
       .filter(Boolean)
       .slice(0, 200);
     const mont = this.currentMont();
-    const month = this.montLabel(mont);
-    const vouchers: Record<string, { count: number; unpaid: number }> = {};
+    const month = this.montStatusLabel(mont);
+    const vouchers: Record<string, { count: number; unpaid: number; month: string }> = {};
     if (!sdnos.length) return { dues: {} as Record<string, { amount: number; count: number }>, mont, month, vouchers };
-    const monthRows = await this.database.query<{ sdno: string; n: string; unpaid: string }>(
-      `SELECT trim(m.sdno) AS sdno, count(*)::text AS n,
-              count(*) FILTER (WHERE NOT ${G_PAID_SQL('m')})::text AS unpaid
-       FROM accmast m
-       WHERE m.sdno = ANY($1::text[]) AND m.invno LIKE '%G' AND trim(m.mont) = $2
-       GROUP BY trim(m.sdno)`,
-      [sdnos, mont],
+    const monthRows = await this.database.query<{ sdno: string; mont: string; n: string; unpaid: string }>(
+      `WITH billed AS (
+         SELECT trim(m.sdno) AS sdno,
+                trim(m.mont) AS mont,
+                right(trim(m.mont), 4) || left(trim(m.mont), 2) AS yyyymm,
+                count(*)::text AS n,
+                count(*) FILTER (WHERE NOT ${G_PAID_SQL('m')})::text AS unpaid
+           FROM accmast m
+          WHERE m.sdno = ANY($1::text[])
+            AND m.invno LIKE '%G'
+            AND length(trim(m.mont)) >= 6
+          GROUP BY trim(m.sdno), trim(m.mont)
+       )
+       SELECT DISTINCT ON (sdno) sdno, mont, n, unpaid
+         FROM billed
+        ORDER BY sdno, yyyymm DESC`,
+      [sdnos],
     );
     for (const r of monthRows.rows) {
-      vouchers[r.sdno] = { count: Number(r.n) || 0, unpaid: Number(r.unpaid) || 0 };
+      vouchers[r.sdno] = {
+        count: Number(r.n) || 0,
+        unpaid: Number(r.unpaid) || 0,
+        month: this.montStatusLabel(r.mont),
+      };
     }
     const rows = await this.database.query<{ sdno: string; amount: string; n: string }>(
       `SELECT trim(m.sdno) AS sdno, coalesce(sum(${this.debitSql}), 0)::text AS amount,
@@ -3001,6 +3015,14 @@ export class FinancialControlService {
   private montLabel(mont: string) {
     const names = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
     return `${names[Number(mont.slice(0, 2)) - 1] || mont.slice(0, 2)}-${mont.slice(2)}`;
+  }
+
+  /** MMYYYY → "Feb 2027" for the Students Register voucher column. */
+  private montStatusLabel(mont: string) {
+    const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const key = String(mont || '').replace(/\D/g, '').padStart(6, '0').slice(-6);
+    const mm = Number(key.slice(0, 2));
+    return `${names[mm - 1] || key.slice(0, 2)} ${key.slice(2)}`;
   }
 
   private addDays(ymd: string, days: number) {
