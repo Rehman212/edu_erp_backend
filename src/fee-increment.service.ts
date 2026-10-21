@@ -17,6 +17,8 @@ export type FeeBulkBody = {
   value?: string | number;
   mont?: string;
   description?: string;
+  dueDate?: string;
+  validityDate?: string;
   sdnos?: unknown;
   invnos?: unknown;
 };
@@ -97,6 +99,10 @@ export class FeeIncrementService {
     const mm = Number(montDigits.slice(0, 2));
     const mont = montDigits.length === 6 && mm >= 1 && mm <= 12 ? montDigits : '';
     const description = String(body.description || '').trim().slice(0, 120);
+    const dueRaw = String(body.dueDate || '').trim().slice(0, 10);
+    const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(dueRaw) ? dueRaw : '';
+    const validityRaw = String(body.validityDate || '').trim().slice(0, 10);
+    const validityDate = /^\d{4}-\d{2}-\d{2}$/.test(validityRaw) ? validityRaw : '';
 
     if (!['increment', 'generate', 'discount', 'delete'].includes(action)) return { error: 'Unknown action.' };
     if (!/^14(01|02|03)01\d{4}$/.test(site)) return { error: 'Select a campus first.' };
@@ -126,7 +132,7 @@ export class FeeIncrementService {
         return { error: 'Discount % must be 1–100.' };
       }
     }
-    return { action, head, mode, value, site, classCode, section, mont, description };
+    return { action, head, mode, value, site, classCode, section, mont, description, dueDate, validityDate };
   }
 
   private nextAmount(current: number, mode: IncrementMode, value: number) {
@@ -395,9 +401,12 @@ export class FeeIncrementService {
                   : `Fine ${p.mont}${p.description ? ` ${p.description}` : ''}`.slice(0, 100);
         const issue = new Date();
         const ymd = `${issue.getFullYear()}-${String(issue.getMonth() + 1).padStart(2, '0')}-${String(issue.getDate()).padStart(2, '0')}`;
-        const dueDate = new Date(`${ymd}T00:00:00Z`);
-        dueDate.setUTCDate(dueDate.getUTCDate() + 10);
-        const due = dueDate.toISOString().slice(0, 10);
+        let due = p.dueDate || '';
+        if (!due) {
+          const autoDue = new Date(`${ymd}T00:00:00Z`);
+          autoDue.setUTCDate(autoDue.getUTCDate() + 10);
+          due = autoDue.toISOString().slice(0, 10);
+        }
 
         for (const r of rows) {
           nextNo += 1;
