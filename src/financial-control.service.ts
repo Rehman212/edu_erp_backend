@@ -2121,6 +2121,8 @@ export class FinancialControlService {
       .filter(Boolean);
     const params: unknown[] = [sdno];
     let onlyClause = '';
+    // When specific invnos are requested (class print), include them even if paid.
+    const unpaidClause = only.length ? '' : `AND NOT ${G_PAID_SQL('m')}`;
     if (only.length) {
       params.push(only);
       onlyClause = `AND m.invno = ANY($2::text[])`;
@@ -2145,7 +2147,7 @@ export class FinancialControlService {
        JOIN accdet d ON d.invno = m.invno
        WHERE m.sdno = $1
          AND m.invno LIKE '%G'
-         AND NOT ${G_PAID_SQL('m')}
+         ${unpaidClause}
          ${onlyClause}
        GROUP BY m.invno, m.invdate, m.dudate, m.mont, m.nar, m.ccode
        HAVING coalesce(sum(${this.debitSql}), 0) > 0

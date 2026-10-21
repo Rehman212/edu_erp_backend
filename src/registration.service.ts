@@ -67,25 +67,22 @@ export class RegistrationService implements OnModuleInit {
   }
 
   async classes() {
+    // Leaf class codes only (assignable on a student). Folders like 1301 are excluded.
     const rows = await this.database.query<{ code: string; name: string }>(
       `SELECT trim(a.acode) AS code, trim(a.ahead) AS name
        FROM acc a
-       WHERE (
-         a.acode = '1301'
-         OR a.acode LIKE '130101%'
-         OR a.acode LIKE '130102%'
-         OR a.acode LIKE '130103%'
-       )
+       WHERE trim(a.acode) ~ '^1301(01|02|03)[0-9]{4}$'
        ORDER BY a.acode`,
     );
     return rows.rows;
   }
 
   async sections() {
+    // Leaf section codes only (assignable on a student).
     const rows = await this.database.query<{ code: string; name: string }>(
       `SELECT trim(a.acode) AS code, trim(a.ahead) AS name
        FROM acc a
-       WHERE a.acode LIKE '130104%'
+       WHERE trim(a.acode) ~ '^130104[0-9]{4}$'
        ORDER BY a.acode`,
     );
     return rows.rows;
