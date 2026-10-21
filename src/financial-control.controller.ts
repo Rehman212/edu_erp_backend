@@ -418,6 +418,11 @@ export class FinancialControlController {
     return this.finance.reversePayments(user ?? '', body?.invnos);
   }
 
+  @Post('delete-challans')
+  deleteChallans(@Headers('x-ess-user') user: string | undefined, @Body() body: { invnos?: string[] }) {
+    return this.finance.deleteChallans(user ?? '', body?.invnos);
+  }
+
   @Get('student-ledger')
   studentLedger(
     @Headers('x-ess-user') user: string | undefined,

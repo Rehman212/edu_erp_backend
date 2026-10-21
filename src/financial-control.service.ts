@@ -2253,6 +2253,88 @@ export class FinancialControlService {
   }
 
   /**
+   * Permanently removes unpaid fee bills (…G). Paid bills must be marked unpaid first.
+   */
+  async deleteChallans(username: string, invnosRaw: unknown) {
+    const invnos = [
+      ...new Set(
+        (Array.isArray(invnosRaw) ? invnosRaw : [])
+          .map((v) => {
+            const raw = String(v || '').trim().toUpperCase();
+            if (!/^\d+[G]?$/.test(raw)) return '';
+            return raw.endsWith('G') ? raw : `${raw}G`;
+          })
+          .filter(Boolean),
+      ),
+    ];
+    if (!invnos.length) return { ok: false, message: 'Select at least one unpaid challan.', done: [], failed: [] };
+
+    const zone = await this.zonePrefix(username);
+    const done: string[] = [];
+    const failed: Array<{ invno: string; message: string }> = [];
+
+    for (const gInv of invnos) {
+      try {
+        let sdno = '';
+        let ccode = '';
+        await this.database.withTransaction(async (client) => {
+          const bill = await client.query<{
+            invno: string;
+            ccode: string;
+            sdno: string;
+            paid: boolean;
+          }>(
+            `SELECT trim(m.invno) AS invno, coalesce(trim(m.ccode), '') AS ccode,
+                    coalesce(trim(m.sdno), '') AS sdno, ${G_PAID_SQL('m')} AS paid
+               FROM accmast m
+              WHERE m.invno = $1
+              LIMIT 1
+              FOR UPDATE`,
+            [gInv],
+          );
+          const row = bill.rows[0];
+          if (!row) throw new Error(`Challan ${gInv} not found.`);
+          if (zone && row.ccode && !row.ccode.startsWith(zone)) {
+            throw new Error(`Challan ${gInv} is outside your zone.`);
+          }
+          if (row.paid) throw new Error(`Challan ${gInv} is paid — mark unpaid first, then delete.`);
+
+          sdno = row.sdno;
+          ccode = row.ccode;
+          await client.query(`DELETE FROM accdet WHERE invno = $1`, [gInv]);
+          await client.query(`DELETE FROM accmast WHERE invno = $1`, [gInv]);
+        });
+        done.push(gInv);
+        await this.activityLog.write({
+          category: 'activity',
+          username: username || 'Unknown',
+          activity: 'Fee Challan Deleted',
+          description: `Deleted unpaid challan ${gInv} for ${sdno}`,
+          module: 'Fee Control',
+          campus: '',
+          campusCode: ccode,
+          status: 'Success',
+          meta: { invno: gInv, sdno },
+        });
+      } catch (err) {
+        failed.push({
+          invno: gInv,
+          message: err instanceof Error ? err.message : 'Failed to delete challan.',
+        });
+      }
+    }
+
+    return {
+      ok: done.length > 0,
+      message: failed.length
+        ? `${done.length} challan(s) deleted, ${failed.length} failed: ${failed.map((f) => `${f.invno} (${f.message})`).join('; ')}`
+        : `${done.length} challan(s) deleted.`,
+      done,
+      failed,
+    };
+  }
+
+  /**
    * Short IDs (1–5 digits, optional S) expand to zone + 5-digit serial + S, e.g. "6406" under SRA →
    * 140106406S, the same way Student Registration search finds them.
    */
@@ -2694,13 +2776,15 @@ export class FinancialControlService {
       migfee: string;
       anualfee: string;
       sumpack: string;
+      security: string;
       adate: string;
     }>(
       `SELECT trim(sdno) AS sdno, coalesce(trim(stat), '') AS stat, coalesce(trim(ccode), '') AS ccode,
               coalesce(trim(class), '') AS cls, left(coalesce(adate::text, ''), 10) AS adate,
               coalesce(tfee, '') AS tfee, coalesce(transfee, '') AS transfee, coalesce(adfee, '') AS adfee,
               coalesce(regfee, '') AS regfee, coalesce(migfee, '') AS migfee,
-              coalesce(anualfee, '') AS anualfee, coalesce(sumpack, '') AS sumpack
+              coalesce(anualfee, '') AS anualfee, coalesce(sumpack, '') AS sumpack,
+              coalesce(security, '') AS security
        FROM student WHERE sdno = $1 LIMIT 1`,
       [sdno],
     );
@@ -2740,6 +2824,14 @@ export class FinancialControlService {
       { id: 'admission', raw: s.adfee, recv: '1502010005', income: '310105', nar: `Admission Fee ${mont}`, scope: 'once' },
       { id: 'registration', raw: s.regfee, recv: '1502010007', income: '310107', nar: `Registration Fee ${mont}`, scope: 'once' },
       { id: 'transfer', raw: s.migfee, recv: '1502010008', income: '310108', nar: `Migration/Re-addmission Fee ${mont}`, scope: 'once' },
+      {
+        id: 'freeze',
+        raw: s.security,
+        recv: '1502010011',
+        income: '310111',
+        nar: `Freeze Admission ${mont}`,
+        scope: 'once',
+      },
       { id: 'annual', raw: s.anualfee, recv: '1502010009', income: '310109', nar: `Annual Fund ${year}`, scope: 'year', billMonth: '03' },
       { id: 'summer', raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year', billMonth: '06' },
       { id: 'tuition', raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
