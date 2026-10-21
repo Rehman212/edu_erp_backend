@@ -3,8 +3,8 @@ import type { QueryResult, QueryResultRow } from 'pg';
 import { ActivityLogService } from './activity-log.service';
 import { DatabaseService } from './database.service';
 
-export type FeeAction = 'increment' | 'generate' | 'discount';
-export type FeeHead = 'tuition' | 'van' | 'annual' | 'summer' | 'fine';
+export type FeeAction = 'increment' | 'generate' | 'discount' | 'delete';
+export type FeeHead = 'tuition' | 'van' | 'annual' | 'summer' | 'fine' | 'freeze';
 export type IncrementMode = 'amount' | 'percent' | 'set' | 'discount';
 
 export type FeeBulkBody = {
@@ -18,10 +18,11 @@ export type FeeBulkBody = {
   mont?: string;
   description?: string;
   sdnos?: unknown;
+  invnos?: unknown;
 };
 
 type HeadSpec = {
-  column: 'tfee' | 'transfee' | 'anualfee' | 'sumpack' | '';
+  column: 'tfee' | 'transfee' | 'anualfee' | 'sumpack' | 'security' | '';
   recv: string;
   income: string;
   scope: 'month' | 'year';
@@ -34,6 +35,7 @@ const HEADS: Record<FeeHead, HeadSpec> = {
   annual: { column: 'anualfee', recv: '1502010009', income: '310109', scope: 'year', label: 'Annual Fund' },
   summer: { column: 'sumpack', recv: '1502010004', income: '310104', scope: 'year', label: 'Summer Task' },
   fine: { column: '', recv: '1502010010', income: '310110', scope: 'month', label: 'Fine' },
+  freeze: { column: 'security', recv: '1502010011', income: '310111', scope: 'month', label: 'Freeze Admission' },
 };
 
 const NUM = (alias: string, col: string) =>
@@ -96,21 +98,25 @@ export class FeeIncrementService {
     const mont = montDigits.length === 6 && mm >= 1 && mm <= 12 ? montDigits : '';
     const description = String(body.description || '').trim().slice(0, 120);
 
-    if (!['increment', 'generate', 'discount'].includes(action)) return { error: 'Unknown action.' };
+    if (!['increment', 'generate', 'discount', 'delete'].includes(action)) return { error: 'Unknown action.' };
     if (!/^14(01|02|03)01\d{4}$/.test(site)) return { error: 'Select a campus first.' };
     if (classCode && !/^1301(01|02|03)(\d{4})?$/.test(classCode)) return { error: 'Invalid class.' };
     if (section && !/^130104\d{4}$/.test(section)) return { error: 'Invalid section.' };
 
     if (action === 'increment') {
-      if (!HEADS[head]?.column) return { error: 'Select the fee to change.' };
+      if (!HEADS[head]?.column || head === 'fine' || head === 'freeze') return { error: 'Select the fee to change.' };
       if (!['amount', 'percent', 'set', 'discount'].includes(mode)) return { error: 'Select how to change the fee.' };
       if (mode === 'set' ? value < 0 : value <= 0) return { error: 'Enter an amount / percentage.' };
       if ((mode === 'percent' || mode === 'discount') && value > 100) return { error: 'Percentage must be 1–100.' };
     }
     if (action === 'generate') {
-      if (!HEADS[head]) return { error: 'Select the fee to generate.' };
+      if (!HEADS[head] || head === 'freeze') return { error: 'Select the fee to generate.' };
       if (!mont) return { error: 'Select the fee month.' };
       if (head === 'fine' && value <= 0) return { error: 'Enter the fine amount.' };
+    }
+    if (action === 'delete') {
+      if (!HEADS[head]) return { error: 'Select the fee vouchers to delete.' };
+      if (!mont) return { error: 'Select the fee month.' };
     }
     if (action === 'discount') {
       if (!mont) return { error: 'Select the fee month.' };
@@ -182,7 +188,7 @@ export class FeeIncrementService {
     only?: Set<string>,
   ): Promise<PreviewRow[]> {
     const spec = HEADS[p.action === 'discount' ? 'tuition' : p.head];
-    const list = (await this.students(p.site, p.classCode, p.section, spec.column)).filter(
+    const list = (await this.students(p.site, p.classCode, p.section, spec.column || '')).filter(
       (s) => !only || only.has(s.sdno),
     );
     const base = (s: (typeof list)[number]) => ({
@@ -207,17 +213,55 @@ export class FeeIncrementService {
     const sdnos = list.map((s) => s.sdno);
     if (!sdnos.length) return [];
     const year = p.mont.slice(2);
-    const bills = await db.query<{ sdno: string; invno: string; amount: string; paid: boolean; snar: string }>(
+    const bills = await db.query<{
+      sdno: string;
+      invno: string;
+      amount: string;
+      paid: boolean;
+      snar: string;
+      name: string;
+      fatherName: string;
+      className: string;
+      sectionName: string;
+    }>(
       `SELECT trim(m.sdno) AS sdno, trim(m.invno) AS invno,
               coalesce((SELECT sum(${NUM('d', 'dr')}) FROM accdet d WHERE d.invno = m.invno), 0)::text AS amount,
               ${G_PAID_SQL('m')} AS paid,
-              coalesce((SELECT max(trim(d.snar)) FROM accdet d WHERE d.invno = m.invno), '') AS snar
+              coalesce((SELECT max(trim(d.snar)) FROM accdet d WHERE d.invno = m.invno), '') AS snar,
+              coalesce(trim(st.name), '') AS name,
+              coalesce(trim(st.fname), '') AS "fatherName",
+              coalesce(nullif(trim(cl.ahead), ''), trim(st.class)) AS "className",
+              coalesce(nullif(trim(se.ahead), ''), coalesce(nullif(trim(st.sec), ''), trim(st.sect)), '') AS "sectionName"
        FROM accmast m
+       JOIN student st ON trim(st.sdno) = trim(m.sdno)
+       LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        WHERE m.sdno = ANY($1::text[]) AND m.invno LIKE '%G' AND trim(m.u4) = $2
          AND (CASE WHEN $3 = 'year' THEN right(trim(m.mont), 4) = $4 ELSE trim(m.mont) = $5 END)
        ORDER BY m.invno`,
       [sdnos, spec.recv, spec.scope, year, p.mont],
     );
+
+    if (p.action === 'delete') {
+      const invFilter =
+        only && [...only].some((x) => /G$/i.test(x))
+          ? new Set([...only].map((x) => x.toUpperCase()))
+          : null;
+      return bills.rows
+        .filter((b) => !invFilter || invFilter.has(b.invno.toUpperCase()) || only?.has(b.sdno))
+        .map((b) => ({
+          sdno: b.sdno,
+          name: b.name,
+          fatherName: b.fatherName,
+          className: b.className,
+          sectionName: b.sectionName,
+          invno: b.invno,
+          current: Math.round(money(b.amount)),
+          next: 0,
+          status: (b.paid ? 'paid' : 'ok') as PreviewRow['status'],
+        }));
+    }
+
     const bySdno = new Map<string, (typeof bills.rows)[number]>();
     for (const b of bills.rows) if (!bySdno.has(b.sdno)) bySdno.set(b.sdno, b);
 
@@ -249,24 +293,49 @@ export class FeeIncrementService {
     if ('error' in p) return { ok: false, message: p.error, done: 0 };
     const zone = await this.zonePrefix(username);
     if (zone && !p.site.startsWith(zone)) return { ok: false, message: 'This campus is outside your zone.', done: 0 };
+    const pickedInvnos = new Set(
+      (Array.isArray(body.invnos) ? body.invnos : [])
+        .map((s) => String(s || '').trim().toUpperCase())
+        .filter((s) => /^\d+G$/.test(s)),
+    );
     const picked = new Set(
       (Array.isArray(body.sdnos) ? body.sdnos : []).map((s) => String(s || '').trim()).filter(Boolean),
     );
-    if (!picked.size) return { ok: false, message: 'Select at least one student.', done: 0 };
-    if (picked.size > 3000) return { ok: false, message: 'Too many students in one run.', done: 0 };
+    if (p.action === 'delete') {
+      if (!pickedInvnos.size && !picked.size) return { ok: false, message: 'Select at least one voucher.', done: 0 };
+    } else if (!picked.size) {
+      return { ok: false, message: 'Select at least one student.', done: 0 };
+    }
+    if (picked.size > 3000 || pickedInvnos.size > 3000) {
+      return { ok: false, message: 'Too many rows in one run.', done: 0 };
+    }
 
     const spec = HEADS[p.action === 'discount' ? 'tuition' : p.head];
     const user = username.trim() || null;
     let done = 0;
     let total = 0;
     const created: string[] = [];
+    const deleted: string[] = [];
 
     try {
       await this.database.withTransaction(async (client) => {
-        if (p.action !== 'increment') {
+        if (p.action !== 'increment' && p.action !== 'delete') {
           await client.query(`SELECT pg_advisory_xact_lock(hashtext('accmast_fee_gf_seq'))`);
         }
-        const rows = (await this.buildRows(client, p, picked)).filter((r) => r.status === 'ok');
+        const filterSet = p.action === 'delete' && pickedInvnos.size ? pickedInvnos : picked;
+        const rows = (await this.buildRows(client, p, filterSet)).filter((r) => r.status === 'ok');
+
+        if (p.action === 'delete') {
+          for (const r of rows) {
+            if (!r.invno) continue;
+            await client.query(`DELETE FROM accdet WHERE invno = $1`, [r.invno]);
+            await client.query(`DELETE FROM accmast WHERE invno = $1`, [r.invno]);
+            deleted.push(r.invno);
+            done += 1;
+            total += r.current;
+          }
+          return;
+        }
 
         if (p.action === 'increment') {
           for (const r of rows) {
@@ -359,12 +428,19 @@ export class FeeIncrementService {
         ? `${spec.label} increment (${p.mode} ${p.value})`
         : p.action === 'discount'
           ? `Tuition discount ${p.mode === 'amount' ? `Rs ${p.value}` : `${p.value}%`} ${p.mont}`
-          : `${spec.label} generation ${p.mont}`;
+          : p.action === 'delete'
+            ? `${spec.label} delete ${p.mont}`
+            : `${spec.label} generation ${p.mont}`;
     await this.activityLog.write({
       category: 'activity',
       username: username || 'Unknown',
-      activity: p.action === 'generate' ? 'Fee Challan Generated' : 'Fee Updated',
-      description: `${what}: ${done} student(s), total ${total}`,
+      activity:
+        p.action === 'generate'
+          ? 'Fee Challan Generated'
+          : p.action === 'delete'
+            ? 'Fee Challan Deleted'
+            : 'Fee Updated',
+      description: `${what}: ${done} ${p.action === 'delete' ? 'voucher(s)' : 'student(s)'}, total ${total}`,
       module: 'Fee Increment',
       campus: '',
       campusCode: p.site,
@@ -380,6 +456,7 @@ export class FeeIncrementService {
         done,
         total,
         created: created.slice(0, 50),
+        deleted: deleted.slice(0, 50),
       },
     });
 
@@ -388,7 +465,9 @@ export class FeeIncrementService {
         ? `${spec.label} updated for ${done} student(s).`
         : p.action === 'discount'
           ? `Discount applied on ${done} tuition bill(s) (total ${total}).`
-          : `${done} ${spec.label} voucher(s) generated (total ${total}).`;
-    return { ok: true, message, done, total, created: created.length };
+          : p.action === 'delete'
+            ? `${done} unpaid ${spec.label} voucher(s) deleted (total ${total}).`
+            : `${done} ${spec.label} voucher(s) generated (total ${total}).`;
+    return { ok: true, message, done, total, created: created.length, deleted: deleted.length };
   }
 }
