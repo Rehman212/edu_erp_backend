@@ -317,16 +317,20 @@ export class RegistrationService implements OnModuleInit {
           OR coalesce(trim(st.sect), '') LIKE $${params.length})`,
       );
     }
+    // Status filters the table only — summary cards stay a breakdown of the
+    // current campus / class / section / search scope (without status).
+    const statusWhere: string[] = [];
+    const statusParams: unknown[] = [];
     if (status.trim()) {
       const s = status.trim().toUpperCase();
       // DB may store Transfered / Transferred / Transfer — match all.
       if (s.startsWith('TRANSFER')) {
-        where.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%'`);
+        statusWhere.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%'`);
       } else if (s.startsWith('PASSOUT')) {
-        where.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'PASSOUT%'`);
+        statusWhere.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'PASSOUT%'`);
       } else {
-        params.push(status.trim());
-        where.push(`upper(trim(coalesce(st.stat, ''))) = upper($${params.length})`);
+        statusParams.push(status.trim());
+        statusWhere.push(`upper(trim(coalesce(st.stat, ''))) = upper($${statusParams.length})`);
       }
     }
     if (q.trim()) {
@@ -459,6 +463,17 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode`;
 
+    const listWhere = [...where];
+    const listParams = [...params];
+    for (const clause of statusWhere) {
+      if (clause.includes('$')) {
+        listParams.push(...statusParams);
+        listWhere.push(`upper(trim(coalesce(st.stat, ''))) = upper($${listParams.length})`);
+      } else {
+        listWhere.push(clause);
+      }
+    }
+
     const count = await this.database.query<{
       total: string;
       active: string;
@@ -477,8 +492,16 @@ export class RegistrationService implements OnModuleInit {
       params,
     );
 
-    const limitIdx = params.length + 1;
-    const offsetIdx = params.length + 2;
+    const filtered = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+       FROM student st
+       ${joins}
+       WHERE ${listWhere.join(' AND ')}`,
+      listParams,
+    );
+
+    const limitIdx = listParams.length + 1;
+    const offsetIdx = listParams.length + 2;
     const rows = await this.database.query<{
       sdno: string;
       rollno: string;
@@ -526,18 +549,18 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc cl ON cl.acode = st.class
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode
-       WHERE ${where.join(' AND ')}
+       WHERE ${listWhere.join(' AND ')}
        ORDER BY length(regexp_replace(coalesce(trim(st.sdno), ''), '\\D', '', 'g')) DESC,
                 regexp_replace(coalesce(trim(st.sdno), ''), '\\D', '', 'g') DESC NULLS LAST,
                 st.name
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
-      [...params, size, offset],
+      [...listParams, size, offset],
     );
 
     const c = count.rows[0];
     return {
       rows: rows.rows,
-      total: Number(c?.total) || 0,
+      total: Number(filtered.rows[0]?.n) || 0,
       page: current,
       pageSize: size,
       stats: {
