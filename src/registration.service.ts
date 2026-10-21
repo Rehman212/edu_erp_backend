@@ -26,7 +26,8 @@ export class RegistrationService implements OnModuleInit {
          ADD COLUMN IF NOT EXISTS remarks text,
          ADD COLUMN IF NOT EXISTS mname varchar(120),
          ADD COLUMN IF NOT EXISTS mnic varchar(40),
-         ADD COLUMN IF NOT EXISTS whatsapp varchar(40)`,
+         ADD COLUMN IF NOT EXISTS whatsapp varchar(40),
+         ADD COLUMN IF NOT EXISTS finefee varchar(40)`,
     );
   }
 
@@ -595,6 +596,7 @@ export class RegistrationService implements OnModuleInit {
               coalesce(nullif(trim(st.transfee), ''), '0') AS "transportFee",
               coalesce(nullif(trim(st.sumpack), ''), '0') AS "summerPack",
               coalesce(nullif(trim(st.security), ''), '0') AS security,
+              coalesce(nullif(trim(st.finefee), ''), '0') AS "fineFee",
               coalesce(trim(st.plevel), '') AS "previousLevel",
               coalesce(trim(st.lcerti), '') AS "leavingCert",
               coalesce(trim(st.pschool), '') AS "previousSchool",
@@ -691,14 +693,14 @@ export class RegistrationService implements OnModuleInit {
          sdno, rollno, name, fname, mname, dob, gndr, religion, nation, caste, occupat, fnic, mnic,
          bhcert, ftyr, class, sec, sect, ccode, paddress, cellno, whatsapp, rphone, ophone,
          gaurdian, relation, stat, atyp, adate, ldate, dpj,
-         adfee, regfee, migfee, tfee, anualfee, transfee, sumpack, security,
+         adfee, regfee, migfee, tfee, anualfee, transfee, sumpack, security, finefee,
          plevel, lcerti, pschool, photo, remarks
        ) VALUES (
          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
          $14,$15,$16,$17,$17,$18,$19,$20,$21,$22,$23,
          $24,$25,$26,$27,$28,$29,$30,
-         $31,$32,$33,$34,$35,$36,$37,$38,
-         $39,$40,$41,$42,$43
+         $31,$32,$33,$34,$35,$36,$37,$38,$39,
+         $40,$41,$42,$43,$44
        )`,
       [
         sdno,
@@ -739,6 +741,7 @@ export class RegistrationService implements OnModuleInit {
         String(moneyNum(body.transportFee ?? body.transfee)),
         String(moneyNum(body.summerPack ?? body.sumpack)),
         String(moneyNum(body.security)),
+        String(moneyNum(body.fineFee ?? body.finefee)),
         String(body.previousLevel || body.plevel || '').trim() || null,
         String(body.leavingCert || body.lcerti || '').trim() || null,
         String(body.previousSchool || body.pschool || '').trim() || null,
@@ -875,6 +878,9 @@ export class RegistrationService implements OnModuleInit {
       set('sumpack', String(moneyNum(body.summerPack ?? body.sumpack)));
     }
     if (body.security !== undefined) set('security', String(moneyNum(body.security)));
+    if (body.fineFee !== undefined || body.finefee !== undefined) {
+      set('finefee', String(moneyNum(body.fineFee ?? body.finefee)));
+    }
     if (body.previousLevel !== undefined || body.plevel !== undefined) {
       set('plevel', String(body.previousLevel || body.plevel || '').trim() || null);
     }

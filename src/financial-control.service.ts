@@ -2777,6 +2777,7 @@ export class FinancialControlService {
       anualfee: string;
       sumpack: string;
       security: string;
+      finefee: string;
       adate: string;
     }>(
       `SELECT trim(sdno) AS sdno, coalesce(trim(stat), '') AS stat, coalesce(trim(ccode), '') AS ccode,
@@ -2784,7 +2785,7 @@ export class FinancialControlService {
               coalesce(tfee, '') AS tfee, coalesce(transfee, '') AS transfee, coalesce(adfee, '') AS adfee,
               coalesce(regfee, '') AS regfee, coalesce(migfee, '') AS migfee,
               coalesce(anualfee, '') AS anualfee, coalesce(sumpack, '') AS sumpack,
-              coalesce(security, '') AS security
+              coalesce(security, '') AS security, coalesce(finefee, '') AS finefee
        FROM student WHERE sdno = $1 LIMIT 1`,
       [sdno],
     );
@@ -2809,7 +2810,9 @@ export class FinancialControlService {
     const want = (id: string) => !picked.length || picked.includes(id);
     const monthMm = montKey.slice(4);
     const summerBreak = monthMm === '06' || monthMm === '07' || monthMm === '08';
-    const fineAmt = round2(Number(fineRaw) || 0);
+    const overrideFine = round2(Number(fineRaw) || 0);
+    const masterFine = round2(Number(String(s.finefee || '').replace(/,/g, '')) || 0);
+    const fineAmt = overrideFine > 0 ? overrideFine : masterFine;
     // Yearly heads follow the legacy billing month (Annual Fund in March, Summer Pack in June),
     // or the admission month for a student who joins mid-year. Van is skipped in Jun–Aug.
     const heads: Array<{
@@ -2836,17 +2839,8 @@ export class FinancialControlService {
       { id: 'summer', raw: s.sumpack, recv: '1502010004', income: '310104', nar: `Summer Pack ${year}`, scope: 'year', billMonth: '06' },
       { id: 'tuition', raw: s.tfee, recv: '1502010001', income: '310101', nar: `Tution Fee ${label}`, scope: 'month' },
       { id: 'van', raw: s.transfee, recv: '1502010003', income: '310103', nar: `Van Fee ${label}`, scope: 'month' },
+      { id: 'fine', raw: String(fineAmt), recv: '1502010010', income: '310110', nar: `Fine ${label}`, scope: 'month' },
     ];
-    if (want('fine') && fineAmt > 0) {
-      heads.push({
-        id: 'fine',
-        raw: String(fineAmt),
-        recv: '1502010010',
-        income: '310110',
-        nar: `Fine ${label}`,
-        scope: 'month',
-      });
-    }
 
     const issue = this.today();
     const soonest = this.addDays(issue, 10);
