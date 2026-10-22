@@ -2170,6 +2170,163 @@ export class FinancialControlService {
     };
   }
 
+  /**
+   * Class / bulk print: load many students' fee bills in one round-trip (by invno).
+   * Order of `items` is preserved; missing invnos are skipped.
+   */
+  async studentChallansBatch(
+    username: string,
+    itemsRaw: unknown,
+  ): Promise<{
+    ok: boolean;
+    message?: string;
+    rows: Array<{
+      sdno: string;
+      student: {
+        sdno: string;
+        name: string;
+        fatherName: string;
+        status: string;
+        siteCode: string;
+        campus: string;
+        classCode: string;
+        className: string;
+        sectionName: string;
+      };
+      challans: Array<{
+        invno: string;
+        invdate: string;
+        dueDate: string;
+        mont: string;
+        narration: string;
+        siteCode: string;
+        amount: number;
+      }>;
+    }>;
+  }> {
+    const items = (Array.isArray(itemsRaw) ? itemsRaw : [])
+      .map((raw) => {
+        const r = raw as { sdno?: string; invno?: string };
+        return {
+          sdno: String(r?.sdno || '')
+            .trim()
+            .toUpperCase(),
+          invno: String(r?.invno || '')
+            .trim()
+            .toUpperCase(),
+        };
+      })
+      .filter((r) => r.invno.endsWith('G'))
+      .slice(0, 2000);
+    if (!items.length) return { ok: false, message: 'No vouchers to load.', rows: [] };
+
+    const invnos = [...new Set(items.map((i) => i.invno))];
+    const zone = await this.zonePrefix(username);
+    const billRows = await this.database.query<{
+      invno: string;
+      invdate: string;
+      dueDate: string;
+      mont: string;
+      narration: string;
+      siteCode: string;
+      amount: string;
+      sdno: string;
+      name: string;
+      fatherName: string;
+      status: string;
+      campus: string;
+      classCode: string;
+      className: string;
+      sectionName: string;
+    }>(
+      `SELECT trim(m.invno) AS invno,
+              left(coalesce(m.invdate, ''), 10) AS invdate,
+              left(coalesce(m.dudate, ''), 10) AS "dueDate",
+              coalesce(trim(m.mont), '') AS mont,
+              coalesce(trim(m.nar), '') AS narration,
+              coalesce(trim(m.ccode), '') AS "siteCode",
+              coalesce(sum(${this.debitSql}), 0)::text AS amount,
+              trim(st.sdno) AS sdno,
+              coalesce(trim(st.name), '') AS name,
+              coalesce(trim(st.fname), '') AS "fatherName",
+              coalesce(trim(st.stat), '') AS status,
+              coalesce(nullif(trim(camp.ahead), ''), trim(st.ccode), '') AS campus,
+              coalesce(trim(st.class), '') AS "classCode",
+              coalesce(nullif(trim(cl.ahead), ''), trim(st.class), '') AS "className",
+              coalesce(nullif(trim(se.ahead), ''), trim(st.sec), '') AS "sectionName"
+       FROM accmast m
+       JOIN accdet d ON d.invno = m.invno
+       JOIN student st ON trim(st.sdno) = trim(m.sdno)
+       LEFT JOIN acc camp ON camp.acode = st.ccode
+       LEFT JOIN acc cl ON cl.acode = st.class
+       LEFT JOIN acc se ON se.acode = st.sec
+       WHERE m.invno = ANY($1::text[])
+         AND ($2 = '' OR coalesce(trim(st.ccode), '') LIKE $2 || '%')
+       GROUP BY m.invno, m.invdate, m.dudate, m.mont, m.nar, m.ccode,
+                st.sdno, st.name, st.fname, st.stat, st.ccode, st.class, st.sec,
+                camp.ahead, cl.ahead, se.ahead
+       HAVING coalesce(sum(${this.debitSql}), 0) > 0`,
+      [invnos, zone || ''],
+    );
+
+    const byInv = new Map(billRows.rows.map((r) => [r.invno.toUpperCase(), r]));
+    const out: Array<{
+      sdno: string;
+      student: {
+        sdno: string;
+        name: string;
+        fatherName: string;
+        status: string;
+        siteCode: string;
+        campus: string;
+        classCode: string;
+        className: string;
+        sectionName: string;
+      };
+      challans: Array<{
+        invno: string;
+        invdate: string;
+        dueDate: string;
+        mont: string;
+        narration: string;
+        siteCode: string;
+        amount: number;
+      }>;
+    }> = [];
+
+    for (const item of items) {
+      const r = byInv.get(item.invno);
+      if (!r) continue;
+      out.push({
+        sdno: r.sdno,
+        student: {
+          sdno: r.sdno,
+          name: r.name,
+          fatherName: r.fatherName,
+          status: r.status,
+          siteCode: r.siteCode,
+          campus: r.campus,
+          classCode: r.classCode,
+          className: r.className,
+          sectionName: r.sectionName,
+        },
+        challans: [
+          {
+            invno: r.invno,
+            invdate: r.invdate,
+            dueDate: r.dueDate,
+            mont: r.mont,
+            narration: r.narration,
+            siteCode: r.siteCode,
+            amount: round2(Number(r.amount) || 0),
+          },
+        ],
+      });
+    }
+
+    return { ok: true, rows: out };
+  }
+
   /** Every fee bill of one student (all months) with its paid status and receipt. */
   async studentLedger(username: string, qRaw: string, site = '') {
     const found = await this.findChallanStudent(username, qRaw, site);

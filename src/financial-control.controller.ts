@@ -373,6 +373,14 @@ export class FinancialControlController {
     return this.finance.studentChallans(user ?? '', q ?? '', only ?? '', site ?? '');
   }
 
+  @Post('student-challans-batch')
+  studentChallansBatch(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { items?: Array<{ sdno?: string; invno?: string }> },
+  ) {
+    return this.finance.studentChallansBatch(user ?? '', body?.items ?? []);
+  }
+
   @Post('generate-challans')
   generateChallans(
     @Headers('x-ess-user') user: string | undefined,
