@@ -2860,16 +2860,17 @@ export class FinancialControlService {
           const amount = round2(Number(String(head.raw).replace(/,/g, '')) || 0);
           if (amount <= 0) continue;
           if (head.scope === 'year' && montKey.slice(4) !== head.billMonth && montKey !== admissionKey) continue;
+          // Month bills: match legacy MMYYYY and YYYYMM so we do not skip/duplicate across formats.
           const billed = await client.query(
             `SELECT 1 FROM accmast m
              WHERE m.sdno = $1 AND m.invno LIKE '%G' AND trim(m.u4) = $2
                AND (
                  $3 = 'once'
                  OR ($3 = 'year' AND right(trim(m.mont), 4) = $4)
-                 OR ($3 = 'month' AND trim(m.mont) = $5)
+                 OR ($3 = 'month' AND trim(m.mont) IN ($5, $6))
                )
              LIMIT 1`,
-            [sdno, head.recv, head.scope, year, mont],
+            [sdno, head.recv, head.scope, year, mont, montKey],
           );
           if (billed.rowCount) continue;
 
