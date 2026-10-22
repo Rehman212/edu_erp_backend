@@ -438,6 +438,27 @@ export class FeeIncrementService {
           done += 1;
           total += r.next;
         }
+
+        // Stamp the chosen due date onto already-billed unpaid vouchers for the same month/head
+        // (Generate skips "billed" rows for insert, but the due date on the slip must still update).
+        if (p.dueDate && picked.size) {
+          const stamped = await client.query(
+            `UPDATE accmast m
+                SET dudate = $1
+              WHERE trim(m.sdno) = ANY($2::text[])
+                AND m.invno LIKE '%G'
+                AND trim(m.u4) = $3
+                AND trim(m.mont) = $4
+                AND NOT EXISTS (
+                  SELECT 1 FROM accmast fx
+                  WHERE fx.invno = left(trim(m.invno), length(trim(m.invno)) - 1) || 'F'
+                )`,
+            [`${p.dueDate} 00:00:00`, [...picked], spec.recv, p.mont],
+          );
+          if (!done && (stamped.rowCount || 0) > 0) {
+            done = stamped.rowCount || 0;
+          }
+        }
       });
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : 'Fee update failed.', done: 0 };

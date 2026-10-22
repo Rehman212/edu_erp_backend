@@ -2847,7 +2847,7 @@ export class FinancialControlService {
     const issue = this.today();
     const soonest = this.addDays(issue, 10);
     const monthDue = `${year}-${montKey.slice(4)}-10`;
-    const customDue = /^\d{4}-\d{2}-\d{2}$/.test(String(dueRaw || '').trim()) ? String(dueRaw).trim() : '';
+    const customDue = this.normDate(String(dueRaw || ''));
     const due = customDue || (monthDue > soonest ? monthDue : soonest);
     const created: Array<{ invno: string; narration: string; amount: number }> = [];
 
@@ -3074,9 +3074,38 @@ export class FinancialControlService {
     return desi.length >= 4 ? desi : '';
   }
 
+  /** YYYY-MM-DD, ISO prefix, DD-MM-YYYY / DD/MM/YYYY, or compact DDMMYYYY → YYYY-MM-DD. */
   private normDate(value: string) {
-    const v = String(value || '').trim();
-    return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : '';
+    const s = String(value || '').trim();
+    if (!s) return '';
+    const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+    if (iso) {
+      const y = Number(iso[1]);
+      const m = Number(iso[2]);
+      const d = Number(iso[3]);
+      if (y >= 1990 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        return `${iso[1]}-${iso[2]}-${iso[3]}`;
+      }
+    }
+    const dmy = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(s);
+    if (dmy) {
+      const dd = dmy[1].padStart(2, '0');
+      const mm = dmy[2].padStart(2, '0');
+      const yyyy = dmy[3];
+      const m = Number(mm);
+      const d = Number(dd);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) return `${yyyy}-${mm}-${dd}`;
+    }
+    const digits = s.replace(/\D/g, '');
+    if (digits.length === 8) {
+      const dd = digits.slice(0, 2);
+      const mm = digits.slice(2, 4);
+      const yyyy = digits.slice(4);
+      const m = Number(mm);
+      const d = Number(dd);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) return `${yyyy}-${mm}-${dd}`;
+    }
+    return '';
   }
 
   private today() {
