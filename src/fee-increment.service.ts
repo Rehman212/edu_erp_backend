@@ -194,8 +194,20 @@ export class FeeIncrementService {
     only?: Set<string>,
   ): Promise<PreviewRow[]> {
     const spec = HEADS[p.action === 'discount' ? 'tuition' : p.head];
+    // Delete apply sends invnos (…G). Those must not be treated as student IDs.
+    const onlyList = only ? [...only] : [];
+    const invFilter =
+      onlyList.length > 0 && onlyList.some((x) => /G$/i.test(x))
+        ? new Set(onlyList.map((x) => x.toUpperCase()).filter((x) => /G$/i.test(x)))
+        : null;
+    const sdnoFilter =
+      only && !invFilter
+        ? only
+        : only && invFilter
+          ? new Set(onlyList.filter((x) => !/G$/i.test(x)))
+          : only;
     const list = (await this.students(p.site, p.classCode, p.section, spec.column || '')).filter(
-      (s) => !only || only.has(s.sdno),
+      (s) => !sdnoFilter?.size || sdnoFilter.has(s.sdno),
     );
     const base = (s: (typeof list)[number]) => ({
       sdno: s.sdno,
@@ -249,12 +261,13 @@ export class FeeIncrementService {
     );
 
     if (p.action === 'delete') {
-      const invFilter =
-        only && [...only].some((x) => /G$/i.test(x))
-          ? new Set([...only].map((x) => x.toUpperCase()))
-          : null;
       return bills.rows
-        .filter((b) => !invFilter || invFilter.has(b.invno.toUpperCase()) || only?.has(b.sdno))
+        .filter(
+          (b) =>
+            !invFilter ||
+            invFilter.has(b.invno.toUpperCase()) ||
+            (sdnoFilter?.size ? sdnoFilter.has(b.sdno) : false),
+        )
         .map((b) => ({
           sdno: b.sdno,
           name: b.name,
@@ -430,7 +443,16 @@ export class FeeIncrementService {
       return { ok: false, message: err instanceof Error ? err.message : 'Fee update failed.', done: 0 };
     }
 
-    if (!done) return { ok: false, message: 'Nothing to update for the selected students.', done: 0 };
+    if (!done) {
+      return {
+        ok: false,
+        message:
+          p.action === 'delete'
+            ? 'Nothing to delete — selected vouchers were not found (or already paid / removed).'
+            : 'Nothing to update for the selected students.',
+        done: 0,
+      };
+    }
 
     const what =
       p.action === 'increment'
