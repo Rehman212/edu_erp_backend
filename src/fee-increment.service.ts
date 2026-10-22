@@ -522,4 +522,46 @@ export class FeeIncrementService {
             : `${done} ${spec.label} voucher(s) generated (total ${total}).`;
     return { ok: true, message, done, total, created: created.length, deleted: deleted.length };
   }
+
+  /**
+   * Bulk print helper: set dudate on the listed unpaid …G vouchers so the slip matches
+   * the Due Date the user picked (already-billed rows are not re-created on Generate).
+   */
+  async stampVoucherDates(
+    username: string,
+    body: { invnos?: unknown; dueDate?: string; site?: string },
+  ) {
+    const dueRaw = String(body.dueDate || '')
+      .trim()
+      .slice(0, 10);
+    const due = /^\d{4}-\d{2}-\d{2}$/.test(dueRaw) ? dueRaw : '';
+    if (!due) return { ok: false, message: 'Due date required (YYYY-MM-DD).', done: 0 };
+
+    const invnos = [
+      ...new Set(
+        (Array.isArray(body.invnos) ? body.invnos : [])
+          .map((v) => String(v || '').trim().toUpperCase())
+          .filter((v) => /^\d+G$/.test(v)),
+      ),
+    ].slice(0, 2000);
+    if (!invnos.length) return { ok: false, message: 'No vouchers selected.', done: 0 };
+
+    const site = String(body.site || '').trim();
+    const zone = await this.zonePrefix(username);
+    if (zone && site && !site.startsWith(zone)) {
+      return { ok: false, message: 'This campus is outside your zone.', done: 0 };
+    }
+
+    const result = await this.database.query(
+      `UPDATE accmast m
+          SET dudate = $1
+        WHERE m.invno = ANY($2::text[])
+          AND m.invno LIKE '%G'
+          AND ($3 = '' OR coalesce(trim(m.ccode), '') = $3)
+          AND ($4 = '' OR coalesce(trim(m.ccode), '') LIKE $4 || '%')
+          AND NOT ${G_PAID_SQL('m')}`,
+      [`${due} 00:00:00`, invnos, site, zone || ''],
+    );
+    return { ok: true, message: `Due date set on ${result.rowCount || 0} voucher(s).`, done: result.rowCount || 0 };
+  }
 }

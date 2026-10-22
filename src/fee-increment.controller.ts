@@ -14,4 +14,12 @@ export class FeeIncrementController {
   apply(@Headers('x-ess-user') user: string | undefined, @Body() body: FeeBulkBody) {
     return this.fees.apply(user ?? '', body || {});
   }
+
+  @Post('stamp-due')
+  stampDue(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { invnos?: string[]; dueDate?: string; site?: string },
+  ) {
+    return this.fees.stampVoucherDates(user ?? '', body || {});
+  }
 }
