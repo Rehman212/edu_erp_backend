@@ -34,6 +34,7 @@ export class FinancialControlController {
     @Query('fromDate') fromDate?: string,
     @Query('toDate') toDate?: string,
     @Query('q') q?: string,
+    @Query('acode') acode?: string,
   ) {
     return this.finance.trialBalance(
       user ?? '',
@@ -41,6 +42,7 @@ export class FinancialControlController {
       fromDate ?? '',
       toDate ?? '',
       q ?? '',
+      acode ?? '',
     );
   }
 

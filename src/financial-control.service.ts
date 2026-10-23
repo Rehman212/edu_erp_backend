@@ -211,10 +211,12 @@ export class FinancialControlService {
     fromDate: string,
     toDate: string,
     q = '',
+    acode = '',
   ) {
     const scope = await this.siteScope(username, site);
     const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
     const search = q.trim().replace(/%/g, '');
+    const accountCode = acode.trim().replace(/%/g, '');
 
     const leaf = await this.database.query<{
       acode: string;
@@ -229,8 +231,13 @@ export class FinancialControlService {
        WHERE m.invdate >= $1 AND m.invdate < $2
          AND ($3 = '' OR m.ccode LIKE $3 || '%')
          AND coalesce(d.acode, '') <> ''
+         AND (
+           $4 = ''
+           OR trim(d.acode) = $4
+           OR trim(d.acode) LIKE $4 || '%'
+         )
        GROUP BY d.acode`,
-      [from, toExclusive, scope],
+      [from, toExclusive, scope, accountCode],
     );
 
     const balMap = new Map<string, { debit: number; credit: number }>();
@@ -305,12 +312,14 @@ export class FinancialControlService {
       else roots.push(node);
     }
 
-    const filtered = search
-      ? this.filterTree(roots, search)
+    // Account head from Filters (Apply) OR free-text Find — both narrow the left tree.
+    const treeQuery = accountCode || search;
+    const filtered = treeQuery
+      ? this.filterTree(roots, treeQuery)
       : roots.filter((n) => n.code.length === 1 || ['1', '2', '3', '4'].includes(n.code));
 
-    // Prefer top-level 1/2/3/4 when no search
-    const displayRoots = search
+    // Prefer top-level 1/2/3/4 when no search / account filter
+    const displayRoots = treeQuery
       ? filtered
       : ['1', '2', '3', '4']
           .map((c) => nodeMap.get(c))
@@ -337,6 +346,7 @@ export class FinancialControlService {
         site: scope,
         fromDate: from,
         toDate: to,
+        acode: accountCode,
         accountCount: balMap.size,
       },
     };
