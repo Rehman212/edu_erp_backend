@@ -164,6 +164,9 @@ export class FinancialControlService {
     const search = q.trim().replace(/%/g, '');
     const size = Math.min(Math.max(Number(limit) || 500, 1), 5000);
     const feeScope = scope.trim().toLowerCase() === 'fee';
+    // Legacy DB often stores Receviable / Receiveable — normalize so "Receivable" still matches.
+    const norm = (expr: string) =>
+      `replace(replace(replace(lower(${expr}), 'receviable', 'receivable'), 'receiveable', 'receivable'), 'receiveables', 'receivables')`;
     const rows = await this.database.query<{
       code: string;
       name: string;
@@ -183,9 +186,18 @@ export class FinancialControlService {
            $1 = ''
            OR a.acode ILIKE '%' || $1 || '%'
            OR a.ahead ILIKE '%' || $1 || '%'
+           OR ${norm('a.ahead')} LIKE '%' || ${norm('$1')} || '%'
          )
        ORDER BY
-         CASE WHEN $3::boolean THEN a.acode ELSE upper(trim(a.ahead)) END,
+         CASE
+           WHEN $1 <> '' AND trim(a.acode) = $1 THEN 0
+           WHEN $1 <> '' AND trim(a.acode) ILIKE $1 || '%' THEN 1
+           WHEN $1 <> '' THEN 2
+           WHEN $3::boolean THEN 3
+           ELSE 4
+         END,
+         CASE WHEN $1 <> '' THEN length(trim(a.acode)) ELSE 0 END,
+         CASE WHEN $3::boolean OR $1 <> '' THEN a.acode ELSE upper(trim(a.ahead)) END,
          a.acode
        LIMIT $2`,
       [search, size, feeScope],
