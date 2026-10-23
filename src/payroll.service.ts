@@ -1950,7 +1950,13 @@ export class PayrollService {
            OR nullif(btrim(p.ldate::text), '') IS NULL
            OR left(btrim(p.ldate::text), 10) IN ('0001-01-01', '1900-01-01')
          )
-         AND ($2 = '' OR coalesce(trim(p.zcode), '') LIKE $2 || '%')
+         -- Match campus OR shorter zone prefix (same as Monthly Salary Sheet).
+         AND (
+           $2 = ''
+           OR coalesce(trim(p.zcode), '') = ''
+           OR trim(p.zcode) LIKE $2 || '%'
+           OR $2 LIKE trim(p.zcode) || '%'
+         )
          ${codeFilter}
        ORDER BY campus, name`,
       params,
@@ -1976,7 +1982,12 @@ export class PayrollService {
         r.lastSecurity != null ? moneyNum(r.lastSecurity) : moneyNum(r.lrate),
       ),
       transport: Math.round(moneyNum(r.lastTransport)),
-      posted: String(r.posted) === 'true',
+      posted: (() => {
+        const v = r.posted as unknown;
+        if (v === true || v === 1) return true;
+        const s = String(v ?? '').trim().toLowerCase();
+        return s === 'true' || s === 't' || s === '1';
+      })(),
     }));
   }
 
