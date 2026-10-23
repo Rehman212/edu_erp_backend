@@ -1898,65 +1898,109 @@ export class PayrollService {
     codes: string[] | null,
     run: (sql: string, params: unknown[]) => Promise<{ rows: Record<string, string>[] }>,
   ): Promise<SalaryBase[]> {
+    if (!(await this.tableExists('persona'))) return [];
+    const cols = await this.columns('persona');
+    const pc = this.personaCols(cols);
+    if (!pc.code || !pc.name) return [];
+
+    const siteCol = pc.site || '';
+    const basicCol = this.pick(cols, ['bsalary', 'salary', 'basic', 'pay', 'gross']);
+    const hrentCol = this.pick(cols, ['hrent', 'houserent', 'hr']);
+    const convCol = this.pick(cols, ['convan', 'conveyance', 'conv']);
+    const utilCol = this.pick(cols, ['utility', 'util']);
+    const messCol = this.pick(cols, ['mess']);
+    const oallCol = this.pick(cols, ['oall', 'otherall', 'oallow']);
+    const lrateCol = this.pick(cols, ['lrate', 'loanrate', 'security']);
+    const payCodeCol = this.pick(cols, ['adcode', 'paycode', 'acode']);
+    const secCodeCol = this.pick(cols, ['lcode', 'seccode']);
+    const trnCodeCol = this.pick(cols, ['mscode', 'trnscode', 'tcode']);
+
+    const hasSalarym = await this.tableExists('salarym');
+    const hasSalaryd = hasSalarym && (await this.tableExists('salaryd'));
+    const smCols = hasSalarym ? await this.columns('salarym') : new Set<string>();
+    const sdCols = hasSalaryd ? await this.columns('salaryd') : new Set<string>();
+    const smOrder = smCols.has('row_id') ? 'm.row_id DESC' : 'm.ctid DESC';
+
     const params: unknown[] = [mont, scope];
     let codeFilter = '';
     if (codes) {
       params.push(codes);
-      codeFilter = `AND trim(p.ecode) = ANY($${params.length}::text[])`;
+      codeFilter = `AND trim(p.${pc.code}) = ANY($${params.length}::text[])`;
     }
+
+    const staFilter = pc.sta
+      ? `AND upper(coalesce(nullif(trim(p.${pc.sta}), ''), 'A')) = 'A'`
+      : '';
+    const leftFilter = pc.left
+      ? `AND (
+           p.${pc.left} IS NULL
+           OR nullif(btrim(p.${pc.left}::text), '') IS NULL
+           OR left(btrim(p.${pc.left}::text), 10) IN ('0001-01-01', '1900-01-01')
+         )`
+      : '';
+    const siteFilter = siteCol
+      ? `AND (
+           $2 = ''
+           OR coalesce(trim(p.${siteCol}), '') = ''
+           OR trim(p.${siteCol}) LIKE $2 || '%'
+           OR $2 LIKE trim(p.${siteCol}) || '%'
+         )`
+      : '';
+
+    // LATERAL last voucher — avoids scanning full salary history for every employee up front.
+    const lastJoin =
+      hasSalarym && hasSalaryd && smCols.has('ecode') && smCols.has('mont') && smCols.has('svno')
+        ? `LEFT JOIN LATERAL (
+             SELECT coalesce(trim(m.excode), '') AS excode,
+                    coalesce(nullif(trim(${sdCols.has('loan') ? 'd.loan' : `''`}), ''), '0') AS loan,
+                    coalesce(nullif(trim(${sdCols.has('itax') ? 'd.itax' : `''`}), ''), '0') AS itax
+             FROM salarym m
+             ${sdCols.has('svno') ? 'JOIN salaryd d ON trim(d.svno) = trim(m.svno)' : 'LEFT JOIN salaryd d ON false'}
+             WHERE trim(m.ecode) = trim(p.${pc.code})
+               AND length(coalesce(trim(m.mont), '')) = 6
+             ORDER BY right(trim(m.mont), 4) DESC, left(trim(m.mont), 2) DESC, ${smOrder}
+             LIMIT 1
+           ) l ON true`
+        : `LEFT JOIN LATERAL (SELECT ''::text AS excode, '0'::text AS loan, '0'::text AS itax) l ON true`;
+
+    const postedExpr = hasSalarym
+      ? `EXISTS (
+           SELECT 1 FROM salarym sm
+           WHERE trim(sm.ecode) = trim(p.${pc.code}) AND trim(sm.mont) = $1
+         )`
+      : 'false';
+
     const res = await run(
-      `WITH last AS (
-         SELECT DISTINCT ON (trim(m.ecode))
-                trim(m.ecode) AS ecode,
-                coalesce(trim(m.excode), '') AS excode,
-                coalesce(nullif(trim(d.loan), ''), '0') AS loan,
-                coalesce(nullif(trim(d.itax), ''), '0') AS itax
-         FROM salarym m
-         JOIN salaryd d ON trim(d.svno) = trim(m.svno)
-         WHERE length(coalesce(trim(m.mont), '')) = 6
-         ORDER BY trim(m.ecode), right(trim(m.mont), 4) DESC, left(trim(m.mont), 2) DESC, m.row_id DESC
-       )
-       SELECT trim(p.ecode) AS code,
-              coalesce(trim(p.ename), '') AS name,
-              coalesce(trim(p.design), '') AS designation,
-              coalesce(trim(p.zcode), '') AS "siteCode",
-              coalesce(nullif(trim(a.ahead), ''), coalesce(trim(p.zcode), '')) AS campus,
-              coalesce(trim(p.regu), '') AS regu,
-              coalesce(p.bsalary, '0') AS basic,
-              coalesce(p.hrent, '0') AS "houseRent",
-              coalesce(p.convan, '0') AS conveyance,
-              coalesce(p.utility, '0') AS utility,
-              coalesce(p.mess, '0') AS mess,
-              coalesce(p.oall, '0') AS "otherAllowance",
-              coalesce(p.lrate, '0') AS lrate,
-              coalesce(trim(p.adcode), '') AS "payableCode",
-              coalesce(trim(p.lcode), '') AS "securityCode",
-              coalesce(trim(p.mscode), '') AS "transportCode",
+      `SELECT trim(p.${pc.code}) AS code,
+              coalesce(nullif(trim(p.${pc.name}), ''), trim(p.${pc.code})) AS name,
+              ${pc.design ? `coalesce(trim(p.${pc.design}), '')` : `''`} AS designation,
+              ${siteCol ? `coalesce(trim(p.${siteCol}), '')` : `''`} AS "siteCode",
+              coalesce(
+                nullif(trim(a.ahead), ''),
+                ${siteCol ? `coalesce(trim(p.${siteCol}), '')` : `''`}
+              ) AS campus,
+              ${pc.regu ? `coalesce(trim(p.${pc.regu}), '')` : `''`} AS regu,
+              ${basicCol ? `coalesce(p.${basicCol}::text, '0')` : `'0'`} AS basic,
+              ${hrentCol ? `coalesce(p.${hrentCol}::text, '0')` : `'0'`} AS "houseRent",
+              ${convCol ? `coalesce(p.${convCol}::text, '0')` : `'0'`} AS conveyance,
+              ${utilCol ? `coalesce(p.${utilCol}::text, '0')` : `'0'`} AS utility,
+              ${messCol ? `coalesce(p.${messCol}::text, '0')` : `'0'`} AS mess,
+              ${oallCol ? `coalesce(p.${oallCol}::text, '0')` : `'0'`} AS "otherAllowance",
+              ${lrateCol ? `coalesce(p.${lrateCol}::text, '0')` : `'0'`} AS lrate,
+              ${payCodeCol ? `coalesce(trim(p.${payCodeCol}), '')` : `''`} AS "payableCode",
+              ${secCodeCol ? `coalesce(trim(p.${secCodeCol}), '')` : `''`} AS "securityCode",
+              ${trnCodeCol ? `coalesce(trim(p.${trnCodeCol}), '')` : `''`} AS "transportCode",
               coalesce(l.excode, '') AS "lastExpense",
               l.loan AS "lastSecurity",
               l.itax AS "lastTransport",
-              EXISTS (
-                SELECT 1 FROM salarym sm
-                WHERE trim(sm.ecode) = trim(p.ecode) AND trim(sm.mont) = $1
-              ) AS posted
+              ${postedExpr} AS posted
        FROM persona p
-       LEFT JOIN acc a ON trim(a.acode) = trim(p.zcode)
-       LEFT JOIN last l ON l.ecode = trim(p.ecode)
-       WHERE coalesce(trim(p.ecode), '') <> ''
-         AND upper(coalesce(nullif(trim(p.sta), ''), 'A')) = 'A'
-         -- Left employees (ldate set) must not appear in salary generate.
-         AND (
-           p.ldate IS NULL
-           OR nullif(btrim(p.ldate::text), '') IS NULL
-           OR left(btrim(p.ldate::text), 10) IN ('0001-01-01', '1900-01-01')
-         )
-         -- Match campus OR shorter zone prefix (same as Monthly Salary Sheet).
-         AND (
-           $2 = ''
-           OR coalesce(trim(p.zcode), '') = ''
-           OR trim(p.zcode) LIKE $2 || '%'
-           OR $2 LIKE trim(p.zcode) || '%'
-         )
+       LEFT JOIN acc a ON ${siteCol ? `trim(a.acode) = trim(p.${siteCol})` : 'false'}
+       ${lastJoin}
+       WHERE coalesce(trim(p.${pc.code}), '') <> ''
+         ${staFilter}
+         ${leftFilter}
+         ${siteFilter}
          ${codeFilter}
        ORDER BY campus, name`,
       params,
@@ -2003,39 +2047,49 @@ export class PayrollService {
   async salaryGenerateDraft(username: string, site: string, mont: string) {
     const info = this.monthInfo(mont);
     if (!info) return { ok: false, message: 'Select a valid month.', rows: [] };
-    const scope = await this.siteScope(username, site);
-    const bases = await this.salaryBases(scope, info.mont, null, (sql, p) =>
-      this.database.query<Record<string, string>>(sql, p),
-    );
-    const pending = bases.filter((b) => !b.posted);
-    const rows = pending.map((b) => {
-      const fig = this.salaryFigures(b, info.days, b);
-      const reason = this.salaryBlockReason(b, fig);
+    try {
+      const scope = await this.siteScope(username, site);
+      const bases = await this.salaryBases(scope, info.mont, null, (sql, p) =>
+        this.database.query<Record<string, string>>(sql, p),
+      );
+      const pending = bases.filter((b) => !b.posted);
+      const rows = pending.map((b) => {
+        const fig = this.salaryFigures(b, info.days, b);
+        const reason = this.salaryBlockReason(b, fig);
+        return {
+          code: b.code,
+          name: b.name,
+          designation: b.designation,
+          siteCode: b.siteCode,
+          campus: b.campus,
+          empType: this.reguLabel(b.regu),
+          basic: b.basic,
+          allowances: fig.fixed - b.basic,
+          fixed: fig.fixed,
+          security: fig.security,
+          transport: fig.transport,
+          gross: fig.gross,
+          net: fig.net,
+          canPost: !reason,
+          reason,
+        };
+      });
       return {
-        code: b.code,
-        name: b.name,
-        designation: b.designation,
-        siteCode: b.siteCode,
-        campus: b.campus,
-        empType: this.reguLabel(b.regu),
-        basic: b.basic,
-        allowances: fig.fixed - b.basic,
-        fixed: fig.fixed,
-        security: fig.security,
-        transport: fig.transport,
-        gross: fig.gross,
-        net: fig.net,
-        canPost: !reason,
-        reason,
+        ok: true,
+        mont: info.mont,
+        days: info.days,
+        postedCount: bases.length - pending.length,
+        rows,
       };
-    });
-    return {
-      ok: true,
-      mont: info.mont,
-      days: info.days,
-      postedCount: bases.length - pending.length,
-      rows,
-    };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        message: `Salary generate failed: ${detail}`.slice(0, 280),
+        rows: [],
+        postedCount: 0,
+      };
+    }
   }
 
   async salaryGeneratePost(
