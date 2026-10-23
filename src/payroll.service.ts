@@ -1023,6 +1023,7 @@ export class PayrollService {
           designation: string;
           empType: string;
           paymentMode: string;
+          sta: string;
           siteCode: string;
           month: string;
           rowDate: string;
