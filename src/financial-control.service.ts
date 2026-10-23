@@ -472,7 +472,8 @@ export class FinancialControlService {
     }
     const scope = await this.siteScope(username, site);
     const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
-    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    // UI pages at 50; Excel/PDF/Print may request the full ledger (up to 10k lines).
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 10000);
     const current = Math.max(Number(page) || 1, 1);
     const offset = (current - 1) * size;
 
