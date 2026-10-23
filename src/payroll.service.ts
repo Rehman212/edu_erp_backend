@@ -1944,6 +1944,12 @@ export class PayrollService {
        LEFT JOIN last l ON l.ecode = trim(p.ecode)
        WHERE coalesce(trim(p.ecode), '') <> ''
          AND upper(coalesce(nullif(trim(p.sta), ''), 'A')) = 'A'
+         -- Left employees (ldate set) must not appear in salary generate.
+         AND (
+           p.ldate IS NULL
+           OR nullif(btrim(p.ldate::text), '') IS NULL
+           OR left(btrim(p.ldate::text), 10) IN ('0001-01-01', '1900-01-01')
+         )
          AND ($2 = '' OR coalesce(trim(p.zcode), '') LIKE $2 || '%')
          ${codeFilter}
        ORDER BY campus, name`,
