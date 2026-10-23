@@ -1,4 +1,15 @@
-import { Body, Controller, Delete, Get, Headers, Param, Post, Put, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Headers,
+  Param,
+  Patch,
+  Post,
+  Put,
+  Query,
+} from '@nestjs/common';
 import { PayrollService } from './payroll.service';
 
 function colFiltersFrom(all?: Record<string, string>) {
@@ -412,5 +423,18 @@ export class PayrollController {
     @Param('code') code: string,
   ) {
     return this.payroll.deleteEmployee(user ?? '', code ?? '');
+  }
+
+  @Patch('employees/:code/active')
+  setEmployeeActive(
+    @Headers('x-ess-user') user: string | undefined,
+    @Param('code') code: string,
+    @Body() body: { active?: boolean },
+  ) {
+    return this.payroll.setEmployeeActive(
+      user ?? '',
+      code ?? '',
+      body?.active === true,
+    );
   }
 }

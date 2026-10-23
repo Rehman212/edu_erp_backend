@@ -159,6 +159,8 @@ export class PayrollService {
       regu: this.pick(cols, ['regu', 'regular', 'etype', 'emptype']),
       // marital / other flag — NOT employment category
       status: this.pick(cols, ['statu', 'status', 'estate']),
+      /** Employment active flag — ESS `sta`: A=Active, anything else = Inactive. */
+      sta: this.pick(cols, ['sta']),
       // paymod before bank (bank is account name, not mode)
       pay: this.pick(cols, ['paymod', 'pmode', 'paymode', 'payment']),
       bank: this.pick(cols, ['bank', 'bankname', 'bname']),
@@ -173,6 +175,12 @@ export class PayrollService {
       photo: this.pick(cols, ['photo', 'pict', 'image']),
       ntn: this.pick(cols, ['ntn']),
     };
+  }
+
+  /** ESS persona.sta — empty / A = active for salary posting. */
+  private isStaActive(raw: string): boolean {
+    const c = String(raw || '').trim().toUpperCase();
+    return !c || c === 'A';
   }
 
   /** ESS Emp Type label from persona.regu code. */
@@ -540,6 +548,7 @@ export class PayrollService {
               ${pc.qual ? `coalesce(trim(p.${pc.qual}), '')` : `''`} AS qualification,
               ${pc.ntn ? `coalesce(trim(p.${pc.ntn}), '')` : `''`} AS ntn,
               ${pc.salary ? `coalesce(p.${pc.salary}::text, '0')` : `'0'`} AS salary,
+              ${pc.sta ? `coalesce(nullif(trim(p.${pc.sta}), ''), 'A')` : `'A'`} AS sta,
               ${cols.has('sick') ? `coalesce(nullif(trim(p.sick), ''), '0')` : `'0'`} AS sick,
               ${cols.has('casu') ? `coalesce(nullif(trim(p.casu), ''), '0')` : `'0'`} AS casu,
               ${cols.has('anu') ? `coalesce(nullif(trim(p.anu), ''), '0')` : `'0'`} AS anu,
@@ -580,6 +589,8 @@ export class PayrollService {
         qualification: r.qualification || '',
         ntn: r.ntn || '',
         salary: round2(moneyNum(r.salary)),
+        sta: String(r.sta || 'A'),
+        empActive: this.isStaActive(String(r.sta || 'A')),
         sick: r.sick || '0',
         casu: r.casu || '0',
         anu: r.anu || '0',
@@ -941,6 +952,7 @@ export class PayrollService {
                  ${pc.design ? `coalesce(trim(p.${pc.design}), '')` : `''`} AS designation,
                  ${pc.regu ? `coalesce(trim(p.${pc.regu}), '')` : `''`} AS "empType",
                  ${pc.pay ? `coalesce(trim(p.${pc.pay}), '')` : `''`} AS "paymentMode",
+                 ${pc.sta ? `coalesce(nullif(trim(p.${pc.sta}), ''), 'A')` : `'A'`} AS sta,
                  coalesce(nullif(trim(m.zcode), ''), coalesce(trim(d.stcode), '')) AS "siteCode",
                  trim(m.mont) AS month,
                  left(coalesce(d.fdate::text, ${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "rowDate",
@@ -974,6 +986,7 @@ export class PayrollService {
                  ${pc.design ? `coalesce(trim(p.${pc.design}), '')` : `''`} AS designation,
                  ${pc.regu ? `coalesce(trim(p.${pc.regu}), '')` : `''`} AS "empType",
                  ${pc.pay ? `coalesce(trim(p.${pc.pay}), '')` : `''`} AS "paymentMode",
+                 ${pc.sta ? `coalesce(nullif(trim(p.${pc.sta}), ''), 'A')` : `'A'`} AS sta,
                  ${pc.site ? `coalesce(trim(p.${pc.site}), '')` : `''`} AS "siteCode",
                  $1::text AS month,
                  left(coalesce(${pc.join ? `p.${pc.join}::text` : `''`}, ''), 10) AS "rowDate",
@@ -1076,6 +1089,8 @@ export class PayrollService {
             salary: basic,
             status: Number(r.has_voucher) ? 'Posted' : 'Not posted',
             voucherNo: r.svno || '',
+            sta: String(r.sta || 'A'),
+            empActive: this.isStaActive(String(r.sta || 'A')),
           };
         });
 
@@ -1799,21 +1814,40 @@ export class PayrollService {
   }
 
   async deleteEmployee(username: string, codeRaw: string) {
+    // Soft-deactivate instead of hard delete (payroll Active/Inactive).
+    return this.setEmployeeActive(username, codeRaw, false);
+  }
+
+  /**
+   * Toggle employment flag on persona.sta (A = Active, I = Inactive).
+   * Salary generate only posts employees with sta = A.
+   */
+  async setEmployeeActive(username: string, codeRaw: string, active: boolean) {
     if (!(await this.tableExists('persona'))) {
       return { ok: false, message: 'Employee table (persona) not found.' };
     }
     const cols = await this.columns('persona');
-    const codeCol = this.pick(cols, ['ecode', 'empno', 'code', 'id']);
-    if (!codeCol) return { ok: false, message: 'Employee code column missing.' };
+    const pc = this.personaCols(cols);
+    if (!pc.code) return { ok: false, message: 'Employee code column missing.' };
+    if (!pc.sta) return { ok: false, message: 'Employee active flag (sta) column missing.' };
     const code = String(codeRaw || '').trim();
     if (!code) return { ok: false, message: 'Employee code required.' };
+    const next = active ? 'A' : 'I';
     const result = await this.database.query(
-      `DELETE FROM persona WHERE trim(${codeCol}) = $1`,
-      [code],
+      `UPDATE persona SET ${pc.sta} = $1 WHERE trim(${pc.code}) = $2`,
+      [next, code],
     );
     if (!result.rowCount) return { ok: false, message: 'Employee not found.' };
     void username;
-    return { ok: true, message: `Employee ${code} deleted.`, code };
+    return {
+      ok: true,
+      message: active
+        ? `Employee ${code} set to Active.`
+        : `Employee ${code} set to Inactive.`,
+      code,
+      active,
+      sta: next,
+    };
   }
 
   private monthInfo(mont: string) {
