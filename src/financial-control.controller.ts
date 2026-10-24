@@ -18,6 +18,12 @@ export class FinancialControlController {
     return this.finance.sites(user ?? '');
   }
 
+  /** ESS voucher Site Code LOV (Ahead / Acode) — same rows & order as Payment Voucher. */
+  @Get('voucher-sites')
+  voucherSites(@Headers('x-ess-user') user?: string) {
+    return this.finance.voucherSites(user ?? '');
+  }
+
   @Get('accounts')
   accounts(
     @Query('q') q?: string,
@@ -448,5 +454,72 @@ export class FinancialControlController {
     @Body() body: { invno?: string },
   ) {
     return this.finance.deleteVoucher(user ?? '', body?.invno ?? '');
+  }
+
+  /** Accounts vouchers: RV cash receipt, PV payment, JV journal, BP/BR bank. */
+  @Get('accounts-vouchers')
+  accountsVouchers(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('suffix') suffix?: string,
+    @Query('site') site?: string,
+    @Query('q') q?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
+  ) {
+    return this.finance.accountsVouchers(
+      user ?? '',
+      suffix ?? 'RV',
+      Number(page) || 1,
+      Number(pageSize) || 50,
+      site ?? '',
+      q ?? '',
+      fromDate ?? '',
+      toDate ?? '',
+    );
+  }
+
+  @Get('accounts-next-invoice')
+  accountsNextInvoice(@Query('suffix') suffix?: string) {
+    return this.finance.accountsNextInvoice(suffix ?? 'RV');
+  }
+
+  @Get('accounts-voucher')
+  accountsVoucherDetail(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('invno') invno?: string,
+  ) {
+    return this.finance.accountsVoucherDetail(user ?? '', invno ?? '');
+  }
+
+  @Post('accounts-voucher')
+  saveAccountsVoucher(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body()
+    body: {
+      invno?: string;
+      invdate?: string;
+      ccode?: string;
+      nar?: string;
+      pday?: string;
+      lines?: Array<{
+        code?: string;
+        accountHead?: string;
+        subNarration?: string;
+        debit?: number | string;
+        credit?: number | string;
+      }>;
+    },
+  ) {
+    return this.finance.saveAccountsVoucher(user ?? '', body ?? {});
+  }
+
+  @Delete('accounts-voucher')
+  deleteAccountsVoucher(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { invno?: string },
+  ) {
+    return this.finance.deleteAccountsVoucher(user ?? '', body?.invno ?? '');
   }
 }

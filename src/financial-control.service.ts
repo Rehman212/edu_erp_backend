@@ -160,6 +160,29 @@ export class FinancialControlService {
     return rows.rows;
   }
 
+  /**
+   * ESS Payment / Receipt voucher Site Code LOV:
+   * Ahead + Acode, 10-digit under 14… (campus …01… + staff …02…), same row order as legacy.
+   * Excludes test/extra campuses not in the ESS Site Code LOV (e.g. Rehman Campus).
+   */
+  async voucherSites(username: string) {
+    const zone = await this.zonePrefix(username);
+    const rows = await this.database.query<{ code: string; name: string }>(
+      `SELECT trim(a.acode) AS code,
+              coalesce(nullif(trim(a.ahead), ''), trim(a.acode)) AS name
+       FROM acc a
+       WHERE length(trim(a.acode)) = 10
+         AND trim(a.acode) LIKE '14%'
+         AND substr(trim(a.acode), 5, 2) IN ('01', '02')
+         AND ($1 = '' OR trim(a.acode) LIKE $1 || '%')
+         AND upper(trim(a.ahead)) NOT IN ('REHMAN CAMPUS')
+         AND trim(a.acode) <> '1403010007'
+       ORDER BY a.row_id NULLS LAST, a.acode`,
+      [zone],
+    );
+    return rows.rows;
+  }
+
   async accounts(q = '', limit = 500, scope = '') {
     const search = q.trim().replace(/%/g, '');
     const size = Math.min(Math.max(Number(limit) || 500, 1), 5000);
@@ -3185,6 +3208,349 @@ export class FinancialControlService {
       status: 'Success',
       meta: { report },
     });
+  }
+
+  /**
+   * Accounts vouchers on accmast by 2-letter suffix: RV / PV / JV / BP / BR.
+   * Cash Receipt = RV (ESS B.E).
+   */
+  async accountsVouchers(
+    username: string,
+    suffixRaw = 'RV',
+    page = 1,
+    pageSize = 50,
+    site = '',
+    q = '',
+    fromDate = '',
+    toDate = '',
+  ) {
+    const suffix = String(suffixRaw || 'RV')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z]/g, '')
+      .slice(0, 2);
+    const letter = /^(RV|PV|JV|BP|BR)$/.test(suffix) ? suffix : 'RV';
+    const scope = await this.siteScope(username, site);
+    const scopeCode = (scope || '').replace(/%/g, '');
+    const search = String(q || '').trim().replace(/%/g, '');
+    const from = this.normDate(String(fromDate || ''));
+    const to = this.normDate(String(toDate || ''));
+    const size = Math.min(Math.max(Number(pageSize) || 50, 1), 200);
+    const pg = Math.max(Number(page) || 1, 1);
+    const offset = (pg - 1) * size;
+
+    const params: unknown[] = [letter, scopeCode, search, from, to];
+    const where = `WHERE right(upper(trim(m.invno)), 2) = $1
+         AND ($2 = '' OR trim(m.ccode) LIKE $2 || '%')
+         AND (
+           $3 = ''
+           OR upper(trim(m.invno)) LIKE '%' || upper($3) || '%'
+           OR upper(coalesce(m.nar, '')) LIKE '%' || upper($3) || '%'
+           OR upper(trim(m.ccode)) LIKE '%' || upper($3) || '%'
+         )
+         AND ($4 = '' OR left(coalesce(nullif(trim(m.invdate), ''), ''), 10) >= $4)
+         AND ($5 = '' OR left(coalesce(nullif(trim(m.invdate), ''), ''), 10) <= $5)`;
+
+    const total = await this.database.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM accmast m ${where}`,
+      params,
+    );
+
+    const rows = await this.database.query<{
+      id: string;
+      invno: string;
+      invdate: string | null;
+      ccode: string;
+      siteName: string;
+      narration: string;
+      pday: string;
+      debit: string;
+      credit: string;
+      suffix: string;
+    }>(
+      `SELECT m.row_id::text AS id,
+              trim(m.invno) AS invno,
+              left(coalesce(nullif(trim(m.invdate), ''), ''), 10) AS invdate,
+              coalesce(trim(m.ccode), '') AS ccode,
+              coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '') AS "siteName",
+              coalesce(trim(m.nar), '') AS narration,
+              coalesce(trim(m.pday), '') AS pday,
+              coalesce(sum(nullif(regexp_replace(trim(d.dr), '[^0-9.\\-]', '', 'g'), '')::numeric), 0)::text AS debit,
+              coalesce(sum(nullif(regexp_replace(trim(d.cr), '[^0-9.\\-]', '', 'g'), '')::numeric), 0)::text AS credit,
+              right(upper(trim(m.invno)), 2) AS suffix
+       FROM accmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+       LEFT JOIN accdet d ON trim(d.invno) = trim(m.invno)
+       ${where}
+       GROUP BY m.row_id, m.invno, m.invdate, m.ccode, a.ahead, m.nar, m.pday
+       ORDER BY m.invdate DESC NULLS LAST, m.invno DESC
+       LIMIT $6 OFFSET $7`,
+      [...params, size, offset],
+    );
+
+    return {
+      rows: rows.rows.map((r) => ({
+        id: r.id,
+        invno: r.invno,
+        invdate: r.invdate || '',
+        ccode: r.ccode,
+        siteName: r.siteName,
+        narration: r.narration,
+        pday: r.pday,
+        debit: Number(r.debit) || 0,
+        credit: Number(r.credit) || 0,
+        suffix: r.suffix,
+      })),
+      total: Number(total.rows[0]?.n || 0),
+      page: pg,
+      pageSize: size,
+      suffix: letter,
+    };
+  }
+
+  private accountsSuffixOk(invno: string) {
+    return /^(RV|PV|JV|BP|BR)$/.test(String(invno || '').trim().toUpperCase().slice(-2));
+  }
+
+  async accountsVoucherDetail(username: string, invnoRaw: string) {
+    const invno = String(invnoRaw || '').trim();
+    if (!invno) return { ok: false, message: 'Invoice required', master: null, lines: [] };
+    if (!this.accountsSuffixOk(invno)) {
+      return { ok: false, message: 'Not an accounts voucher (RV/PV/JV/BP/BR).', master: null, lines: [] };
+    }
+    const zone = await this.zonePrefix(username);
+    const master = await this.database.query<{
+      invno: string;
+      invdate: string | null;
+      ccode: string;
+      siteName: string;
+      narration: string;
+      pday: string;
+      suffix: string;
+    }>(
+      `SELECT trim(m.invno) AS invno,
+              left(coalesce(nullif(trim(m.invdate), ''), ''), 10) AS invdate,
+              coalesce(trim(m.ccode), '') AS ccode,
+              coalesce(nullif(trim(a.ahead), ''), trim(m.ccode), '') AS "siteName",
+              coalesce(trim(m.nar), '') AS narration,
+              coalesce(trim(m.pday), '') AS pday,
+              right(upper(trim(m.invno)), 2) AS suffix
+       FROM accmast m
+       LEFT JOIN acc a ON trim(a.acode) = trim(m.ccode)
+       WHERE trim(m.invno) = $1
+         AND ($2 = '' OR trim(m.ccode) LIKE $2 || '%')
+       LIMIT 1`,
+      [invno, zone],
+    );
+    const row = master.rows[0];
+    if (!row) return { ok: false, message: 'Voucher not found', master: null, lines: [] };
+
+    const lines = await this.database.query<{
+      code: string;
+      accountHead: string;
+      subNarration: string;
+      debit: string;
+      credit: string;
+    }>(
+      `SELECT coalesce(trim(d.acode), '') AS code,
+              coalesce(nullif(trim(a.ahead), ''), trim(d.acode), '') AS "accountHead",
+              coalesce(trim(d.snar), '') AS "subNarration",
+              coalesce(nullif(regexp_replace(trim(d.dr), '[^0-9.\\-]', '', 'g'), ''), '0') AS debit,
+              coalesce(nullif(regexp_replace(trim(d.cr), '[^0-9.\\-]', '', 'g'), ''), '0') AS credit
+       FROM accdet d
+       LEFT JOIN acc a ON trim(a.acode) = trim(d.acode)
+       WHERE trim(d.invno) = $1
+       ORDER BY d.row_id`,
+      [invno],
+    );
+
+    return {
+      ok: true,
+      message: '',
+      master: row,
+      lines: lines.rows.map((l, i) => ({
+        id: `${invno}-${i}`,
+        code: l.code,
+        accountHead: l.accountHead,
+        subNarration: l.subNarration,
+        accountBal: '',
+        debit: l.debit,
+        credit: l.credit,
+      })),
+    };
+  }
+
+  async deleteAccountsVoucher(username: string, invnoRaw: string) {
+    const invno = String(invnoRaw || '').trim();
+    if (!invno) return { ok: false, message: 'Invoice required' };
+    if (!this.accountsSuffixOk(invno)) {
+      return { ok: false, message: 'Only accounts vouchers (RV/PV/JV/BP/BR) can be deleted here.' };
+    }
+    const detail = await this.accountsVoucherDetail(username, invno);
+    if (!detail.ok || !detail.master) {
+      return { ok: false, message: detail.message || 'Voucher not found' };
+    }
+    try {
+      await this.database.withTransaction(async (client) => {
+        await client.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
+        await client.query(`DELETE FROM accmast WHERE trim(invno) = $1`, [invno]);
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to delete voucher.';
+      return { ok: false, message };
+    }
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: 'Accounts Voucher Deleted',
+      description: `Deleted accounts voucher ${invno}`,
+      module: 'Transaction',
+      campus: '',
+      campusCode: detail.master.ccode || '',
+      status: 'Success',
+      meta: { invno },
+    });
+    return { ok: true, message: `Voucher ${invno} deleted.`, invno };
+  }
+
+  async saveAccountsVoucher(
+    username: string,
+    body: {
+      invno?: string;
+      invdate?: string;
+      ccode?: string;
+      nar?: string;
+      pday?: string;
+      lines?: Array<{
+        code?: string;
+        accountHead?: string;
+        subNarration?: string;
+        debit?: number | string;
+        credit?: number | string;
+      }>;
+    },
+  ) {
+    const invno = String(body.invno || '').trim();
+    if (!invno) return { ok: false, message: 'Invoice required' };
+    if (!this.accountsSuffixOk(invno)) {
+      return { ok: false, message: 'Invalid accounts voucher number (need …RV/PV/JV/BP/BR).' };
+    }
+    const invdate = this.normDate(String(body.invdate || '')) || this.today();
+    const ccode = String(body.ccode || '').trim();
+    const zone = await this.zonePrefix(username);
+    if (ccode && zone && !(ccode === zone || ccode.startsWith(zone))) {
+      return { ok: false, message: 'Campus outside your zone.' };
+    }
+    const nar = String(body.nar || '').trim();
+    const pday = String(body.pday || '').trim();
+    const rawLines = Array.isArray(body.lines) ? body.lines : [];
+    const lines: Array<{ code: string; debit: number; credit: number; snar: string }> = [];
+    for (const line of rawLines) {
+      const code = String(line.code || '').trim();
+      const debit = round2(Math.max(0, Number(line.debit) || 0));
+      const credit = round2(Math.max(0, Number(line.credit) || 0));
+      if (!code && debit <= 0 && credit <= 0) continue;
+      if (!code) return { ok: false, message: 'Every line needs an account code.' };
+      if (debit <= 0 && credit <= 0) {
+        return { ok: false, message: `Line ${code} needs a debit or credit amount.` };
+      }
+      lines.push({
+        code,
+        debit,
+        credit,
+        snar: String(line.subNarration || '').trim(),
+      });
+    }
+    if (!lines.length) return { ok: false, message: 'At least one voucher line is required.' };
+    const totalDebit = round2(lines.reduce((s, l) => s + l.debit, 0));
+    const totalCredit = round2(lines.reduce((s, l) => s + l.credit, 0));
+    if (Math.abs(totalDebit - totalCredit) > 0.005) {
+      return {
+        ok: false,
+        message: `Debit (${totalDebit.toFixed(2)}) must equal Credit (${totalCredit.toFixed(2)}).`,
+      };
+    }
+
+    const exists = await this.database.query(`SELECT 1 FROM accmast WHERE trim(invno) = $1 LIMIT 1`, [
+      invno,
+    ]);
+    const isUpdate = Boolean(exists.rowCount);
+    const invdateStore = `${invdate} 00:00:00`;
+    const uname = username.trim() || '';
+
+    try {
+      await this.database.withTransaction(async (client) => {
+        if (isUpdate) {
+          await client.query(
+            `UPDATE accmast
+             SET invdate = $2, ccode = $3, nar = $4, pday = $5, uname = $6, edate = $2
+             WHERE trim(invno) = $1`,
+            [invno, invdateStore, ccode, nar, pday, uname],
+          );
+          await client.query(`DELETE FROM accdet WHERE trim(invno) = $1`, [invno]);
+        } else {
+          await client.query(
+            `INSERT INTO accmast (invno, invdate, ccode, nar, pday, uname, edate, pflag)
+             VALUES ($1, $2, $3, $4, $5, $6, $2, '1')`,
+            [invno, invdateStore, ccode, nar, pday, uname],
+          );
+        }
+        for (const line of lines) {
+          await client.query(
+            `INSERT INTO accdet (invno, acode, dr, cr, snar)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [invno, line.code, String(line.debit), String(line.credit), line.snar || null],
+          );
+        }
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to save voucher.';
+      return { ok: false, message };
+    }
+
+    await this.activityLog.write({
+      category: 'activity',
+      username: username || 'Unknown',
+      activity: isUpdate ? 'Accounts Voucher Updated' : 'Accounts Voucher Created',
+      description: `${isUpdate ? 'Updated' : 'Created'} ${invno} (${lines.length} lines)`,
+      module: 'Transaction',
+      campus: '',
+      campusCode: ccode,
+      status: 'Success',
+      meta: { invno, totalDebit, totalCredit },
+    });
+
+    return this.accountsVoucherDetail(username, invno);
+  }
+
+  /** Next invno for RV/PV/JV/BP/BR on accmast (e.g. 00536RV). */
+  async accountsNextInvoice(suffixRaw = 'RV') {
+    const suffix = String(suffixRaw || 'RV')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z]/g, '')
+      .slice(0, 2);
+    const letter = /^(RV|PV|JV|BP|BR)$/.test(suffix) ? suffix : 'RV';
+    const next = await this.database.query<{ n: string; last: string | null; dig: string | null }>(
+      `SELECT (coalesce(
+         max(nullif(regexp_replace(trim(invno), '[^0-9]', '', 'g'), '')::bigint),
+         0
+       ) + 1)::text AS n,
+       max(trim(invno)) AS last,
+       max(length(nullif(regexp_replace(trim(invno), '[^0-9]', '', 'g'), '')))::text AS dig
+       FROM accmast
+       WHERE right(upper(trim(invno)), 2) = $1`,
+      [letter],
+    );
+    const seq = Number(next.rows[0]?.n ?? 1);
+    const digLen = Math.max(Number(next.rows[0]?.dig || 5) || 5, 5);
+    const invno = `${String(seq).padStart(digLen, '0')}${letter}`;
+    return {
+      ok: true,
+      suffix: letter,
+      lastInvno: next.rows[0]?.last || null,
+      invno,
+    };
   }
 
   private parentCodes(code: string): string[] {
