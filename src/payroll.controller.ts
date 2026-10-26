@@ -129,6 +129,7 @@ export class PayrollController {
     @Query('empType') empType?: string,
     @Query('designation') designation?: string,
     @Query('paymentMode') paymentMode?: string,
+    @Query('empActive') empActive?: string,
     @Query('employee') employee?: string,
     @Query('q') q?: string,
     @Query('page') page?: string,
@@ -153,6 +154,7 @@ export class PayrollController {
           toDate ?? '',
           employee ?? '',
           q ?? '',
+          empActive ?? '',
         ),
       sumOf('net'),
     );

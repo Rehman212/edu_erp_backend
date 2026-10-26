@@ -464,6 +464,8 @@ export class PayrollService {
       empType?: string;
       designation?: string;
       paymentMode?: string;
+      /** A = Active, I = Inactive, empty = all */
+      empActive?: string;
       q?: string;
       page?: number;
       pageSize?: number;
@@ -512,6 +514,11 @@ export class PayrollService {
     if (pc.pay && payFilter) {
       params.push(payFilter.toUpperCase());
       where.push(`upper(trim(p.${pc.pay})) = $${params.length}`);
+    }
+    const empFlag = String(filters.empActive || '').trim().toUpperCase();
+    if (pc.sta && (empFlag === 'A' || empFlag === 'I')) {
+      const staExpr = `upper(coalesce(nullif(trim(p.${pc.sta}), ''), 'A'))`;
+      where.push(empFlag === 'A' ? `${staExpr} = 'A'` : `${staExpr} <> 'A'`);
     }
     if (filters.q?.trim()) {
       params.push(`%${filters.q.trim()}%`);
@@ -836,6 +843,7 @@ export class PayrollService {
     toDate = '',
     employee = '',
     q = '',
+    empActive = '',
   ) {
     const explicitMont = String(mont || '').trim();
     const from = String(fromDate || '').trim();
@@ -944,6 +952,18 @@ export class PayrollService {
           params.push(sheetPay.toUpperCase());
           vWhere.push(`upper(trim(p.${pc.pay})) = $${params.length}`);
           pWhere.push(`upper(trim(p.${pc.pay})) = $${params.length}`);
+        }
+        // Employment: A = Active (empty/A), I = Inactive (anything else on persona.sta)
+        const empFlag = String(empActive || '').trim().toUpperCase();
+        if (pc.sta && (empFlag === 'A' || empFlag === 'I')) {
+          const staExpr = `upper(coalesce(nullif(trim(p.${pc.sta}), ''), 'A'))`;
+          if (empFlag === 'A') {
+            vWhere.push(`${staExpr} = 'A'`);
+            pWhere.push(`${staExpr} = 'A'`);
+          } else {
+            vWhere.push(`${staExpr} <> 'A'`);
+            pWhere.push(`${staExpr} <> 'A'`);
+          }
         }
 
         const voucherSelect = `
@@ -1122,6 +1142,7 @@ export class PayrollService {
       empType,
       designation,
       paymentMode,
+      empActive,
       q: search,
       page,
       pageSize,
@@ -1187,6 +1208,7 @@ export class PayrollService {
       toDate,
       employee,
       q,
+      '',
     );
     const byDesign = new Map<
       string,
