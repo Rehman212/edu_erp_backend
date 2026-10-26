@@ -464,6 +464,14 @@ export class RegistrationService implements OnModuleInit {
                   AND to_char(left(trim(st.adate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
           );
           break;
+        case 'leftDate':
+          params.push(`%${v}%`);
+          where.push(
+            `(coalesce(trim(st.ldate), '') ILIKE $${params.length}
+              OR (trim(st.ldate) ~ '^\\d{4}-\\d{2}-\\d{2}'
+                  AND to_char(left(trim(st.ldate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
+          );
+          break;
         case 'admissionType':
           exact('trim(st.atyp)', v);
           break;
@@ -556,6 +564,7 @@ export class RegistrationService implements OnModuleInit {
       phone: string;
       status: string;
       admitDate: string;
+      leftDate: string;
       tuitionFee: string;
     }>(
       `SELECT trim(st.sdno) AS sdno,
@@ -578,6 +587,7 @@ export class RegistrationService implements OnModuleInit {
               coalesce(trim(st.stat), '') AS status,
               coalesce(trim(st.atyp), '') AS "admissionType",
               left(coalesce(st.adate::text, ''), 10) AS "admitDate",
+              left(coalesce(st.ldate::text, ''), 10) AS "leftDate",
               coalesce(nullif(trim(st.adfee), ''), '0') AS "admissionFee",
               coalesce(nullif(trim(st.regfee), ''), '0') AS "registrationFee",
               coalesce(nullif(trim(st.tfee), ''), '0') AS "tuitionFee",
