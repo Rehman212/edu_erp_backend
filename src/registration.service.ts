@@ -285,6 +285,8 @@ export class RegistrationService implements OnModuleInit {
     page = 1,
     pageSize = 50,
     colFilters: Record<string, string> = {},
+    fromDate = '',
+    toDate = '',
   ) {
     const scope = await this.siteScope(username, site);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 1000);
@@ -312,6 +314,22 @@ export class RegistrationService implements OnModuleInit {
       where.push(
         `(coalesce(trim(st.sec), '') LIKE $${params.length}
           OR coalesce(trim(st.sect), '') LIKE $${params.length})`,
+      );
+    }
+    // Admit date range (ISO yyyy-mm-dd); string compare is safe for ISO dates.
+    const from = String(fromDate || '').trim().slice(0, 10);
+    const to = String(toDate || '').trim().slice(0, 10);
+    const admitExpr = `left(coalesce(trim(st.adate::text), ''), 10)`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      params.push(from);
+      where.push(
+        `(${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} >= $${params.length})`,
+      );
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      params.push(to);
+      where.push(
+        `(${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} <= $${params.length})`,
       );
     }
     // Status filters the table only — summary cards stay a breakdown of the

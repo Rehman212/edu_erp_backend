@@ -60,6 +60,8 @@ export class RegistrationController {
     @Query('section') section?: string,
     @Query('status') status?: string,
     @Query('q') q?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
     @Query() all?: Record<string, string>,
@@ -80,6 +82,8 @@ export class RegistrationController {
       Number(page) || 1,
       Number(pageSize) || 50,
       colFilters,
+      fromDate ?? '',
+      toDate ?? '',
     );
   }
 
