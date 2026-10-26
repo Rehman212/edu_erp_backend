@@ -316,28 +316,42 @@ export class RegistrationService implements OnModuleInit {
           OR coalesce(trim(st.sect), '') LIKE $${params.length})`,
       );
     }
-    // Admit date range (ISO yyyy-mm-dd); string compare is safe for ISO dates.
+    // Date range (ISO yyyy-mm-dd).
+    // Cards: always admit/register date (adate).
+    // Table with Left/Passout/Transfer: leave date (ldate); else adate.
     const from = String(fromDate || '').trim().slice(0, 10);
     const to = String(toDate || '').trim().slice(0, 10);
+    const statusKey = status.trim().toUpperCase();
+    const useLeaveDate =
+      statusKey === 'LEFT' ||
+      statusKey.startsWith('PASSOUT') ||
+      statusKey.startsWith('TRANSFER');
     const admitExpr = `left(coalesce(trim(st.adate::text), ''), 10)`;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
-      params.push(from);
-      where.push(
-        `(${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} >= $${params.length})`,
-      );
-    }
-    if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-      params.push(to);
-      where.push(
-        `(${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} <= $${params.length})`,
-      );
+    const leaveExpr = `left(coalesce(trim(st.ldate::text), ''), 10)`;
+    const pushDateRange = (expr: string, target: string[], targetParams: unknown[]) => {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+        targetParams.push(from);
+        target.push(
+          `(${expr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${expr} >= $${targetParams.length})`,
+        );
+      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+        targetParams.push(to);
+        target.push(
+          `(${expr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${expr} <= $${targetParams.length})`,
+        );
+      }
+    };
+    // Shared scope uses admit date only when the table also filters by admit.
+    if (!useLeaveDate) {
+      pushDateRange(admitExpr, where, params);
     }
     // Status filters the table only — summary cards stay a breakdown of the
-    // current campus / class / section / search scope (without status).
+    // current campus / class / section / search / date scope (without status).
     const statusWhere: string[] = [];
     const statusParams: unknown[] = [];
     if (status.trim()) {
-      const s = status.trim().toUpperCase();
+      const s = statusKey;
       // DB may store Transfered / Transferred / Transfer — match all.
       if (s.startsWith('TRANSFER')) {
         statusWhere.push(`upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%'`);
@@ -478,6 +492,13 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode`;
 
+    // Cards: always admit-date scoped (even when table uses leave date).
+    const statsWhere = [...where];
+    const statsParams = [...params];
+    if (useLeaveDate) {
+      pushDateRange(admitExpr, statsWhere, statsParams);
+    }
+
     const listWhere = [...where];
     const listParams = [...params];
     for (const clause of statusWhere) {
@@ -487,6 +508,9 @@ export class RegistrationService implements OnModuleInit {
       } else {
         listWhere.push(clause);
       }
+    }
+    if (useLeaveDate) {
+      pushDateRange(leaveExpr, listWhere, listParams);
     }
 
     const count = await this.database.query<{
@@ -503,8 +527,8 @@ export class RegistrationService implements OnModuleInit {
               count(*) FILTER (WHERE upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%')::text AS transferred
        FROM student st
        ${joins}
-       WHERE ${where.join(' AND ')}`,
-      params,
+       WHERE ${statsWhere.join(' AND ')}`,
+      statsParams,
     );
 
     const filtered = await this.database.query<{ n: string }>(
