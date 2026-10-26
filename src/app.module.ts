@@ -25,6 +25,8 @@ import { SettingsController } from './settings.controller';
 import { SettingsService } from './settings.service';
 import { FeeIncrementController } from './fee-increment.controller';
 import { FeeIncrementService } from './fee-increment.service';
+import { DashboardController } from './dashboard.controller';
+import { DashboardService } from './dashboard.service';
 @Module({
   imports: [],
   controllers: [
@@ -41,6 +43,7 @@ import { FeeIncrementService } from './fee-increment.service';
     ActivityLogController,
     SettingsController,
     FeeIncrementController,
+    DashboardController,
   ],
   providers: [
     AppService,
@@ -56,6 +59,7 @@ import { FeeIncrementService } from './fee-increment.service';
     UsersService,
     SettingsService,
     FeeIncrementService,
+    DashboardService,
   ],
 })
 export class AppModule {}

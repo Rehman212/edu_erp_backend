@@ -547,8 +547,8 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode
        WHERE ${listWhere.join(' AND ')}
-       ORDER BY length(regexp_replace(coalesce(trim(st.sdno), ''), '\\D', '', 'g')) DESC,
-                regexp_replace(coalesce(trim(st.sdno), ''), '\\D', '', 'g') DESC NULLS LAST,
+       ORDER BY st.row_id DESC NULLS LAST,
+                left(coalesce(st.adate::text, ''), 10) DESC NULLS LAST,
                 st.name
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
       [...listParams, size, offset],
@@ -656,18 +656,19 @@ export class RegistrationService implements OnModuleInit {
   }
 
   async nextStudentCode(username: string, site: string) {
-    const scope = await this.siteScope(username, site);
-    const zoneRoot = this.zoneRootCode(scope || site);
+    const raw = String(site || '').trim();
+    // Leaf campus → always use that campus's zone for the next ID (140101… → 1401).
+    // Do NOT clamp to the user's desi zone here — that produced MTZ IDs on SRA campuses.
+    let zoneRoot = isLeafCampus(raw) ? this.zoneRootCode(raw) : '';
+    if (!zoneRoot) {
+      const scope = await this.siteScope(username, raw);
+      zoneRoot = this.zoneRootCode(scope || raw);
+    }
     const params: unknown[] = [];
     const where = [`coalesce(trim(st.sdno), '') <> ''`];
-    // Always key next ID off student-code zone prefix (not ccode), so a 1403-*
-    // student parked on an SRA campus cannot produce the next SRA registration ID.
     if (zoneRoot) {
       params.push(`${zoneRoot}%`);
       where.push(`trim(st.sdno) LIKE $${params.length}`);
-    } else if (scope) {
-      params.push(`${scope}%`);
-      where.push(`coalesce(trim(st.ccode), '') LIKE $${params.length}`);
     }
     const rows = await this.database.query<{ sdno: string }>(
       `SELECT trim(st.sdno) AS sdno
@@ -679,8 +680,8 @@ export class RegistrationService implements OnModuleInit {
       params,
     );
     const last = String(rows.rows[0]?.sdno || '').trim();
-    const code = this.bumpStudentCode(last, zoneRoot || scope || site);
-    return { ok: true, code, lastCode: last };
+    const code = this.bumpStudentCode(last, zoneRoot || raw);
+    return { ok: true, code, lastCode: last, zone: zoneRoot };
   }
 
   async createStudent(
@@ -694,7 +695,10 @@ export class RegistrationService implements OnModuleInit {
     if (!isLeafCampus(siteCode)) {
       return { ok: false, message: 'Select a campus, not a zone.' };
     }
-    if (!sdno) {
+    const campusZone = this.zoneRootCode(siteCode);
+    const sdnoZone = this.zoneRootCode(sdno);
+    // Regenerate when missing or when ID zone ≠ selected campus zone (common UI bug).
+    if (!sdno || (campusZone && sdnoZone && campusZone !== sdnoZone)) {
       const next = await this.nextStudentCode(username, siteCode);
       sdno = String(next.code || '').trim();
     }
