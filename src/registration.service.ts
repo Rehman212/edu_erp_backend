@@ -12,6 +12,67 @@ function leftDate(v: unknown): string {
   return s.length >= 10 ? s.slice(0, 10) : s;
 }
 
+/** Query dates may arrive as YYYY-MM-DD or DD/MM/YYYY. Invalid values are ignored. */
+function parseQueryDate(value: unknown): string {
+  const s = String(value ?? '').trim();
+  if (!s) return '';
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return calendarDate(iso[1], iso[2], iso[3]);
+  const dmy = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})(?:\D|$)/);
+  if (dmy) return calendarDate(dmy[3], dmy[2].padStart(2, '0'), dmy[1].padStart(2, '0'));
+  return '';
+}
+
+function calendarDate(year: string, month: string, day: string): string {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  if (!Number.isInteger(y) || m < 1 || m > 12 || d < 1 || d > 31) return '';
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return '';
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+/** Column date search: raw text, "28 Feb 2025" / "28 Sept 2019", or 14/10/2026. */
+function pushDateTextFilter(
+  params: unknown[],
+  where: string[],
+  column: 'adate' | 'ldate',
+  raw: string,
+) {
+  const v = raw.trim();
+  if (!v) return;
+  const expr = `left(coalesce(trim(st.${column}::text), ''), 10)`;
+  params.push(`%${v}%`);
+  const like = params.length;
+  const parts = [
+    `coalesce(trim(st.${column}::text), '') ILIKE $${like}`,
+    `(${expr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND replace(to_char(${expr}::date, 'DD Mon YYYY'), 'Sep', 'Sept') ILIKE $${like})`,
+  ];
+  const iso = parseQueryDate(v);
+  if (iso) {
+    params.push(iso);
+    parts.push(`${expr} = $${params.length}`);
+  }
+  where.push(`(${parts.join(' OR ')})`);
+}
+
+/** Passout / Left / Transfer → Left Date. Active / Admission → Register Date. */
+function periodKindFromStatus(statusKey: string): 'admit' | 'leave' | 'either' | 'none' {
+  if (statusKey === 'ADMISSION' || statusKey === 'ACTIVE') return 'admit';
+  if (
+    statusKey === 'WITHDRAWAL' ||
+    statusKey === 'LEAVE' ||
+    statusKey === 'LEFT' ||
+    statusKey.startsWith('PASSOUT') ||
+    statusKey.startsWith('TRANSFER')
+  ) {
+    return 'leave';
+  }
+  if (statusKey === 'ADMISSION_OR_WITHDRAWAL' || statusKey === 'EITHER') return 'either';
+  return 'none';
+}
+
 function isLeafCampus(code: string) {
   return /^14(01|02|03)01\d{4}$/.test(String(code || '').trim());
 }
@@ -287,7 +348,7 @@ export class RegistrationService implements OnModuleInit {
     colFilters: Record<string, string> = {},
     fromDate = '',
     toDate = '',
-    dateField = 'admit',
+    dateField = '',
   ) {
     const scope = await this.siteScope(username, site);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 1000);
@@ -318,11 +379,12 @@ export class RegistrationService implements OnModuleInit {
       );
     }
     // Date range column:
-    //   Active / Admission / empty → Register Date (adate)
-    //   Left / Passout / Transfer / Withdrawal → Left Date (ldate)
-    //   dateField query can still force admit|leave|either
-    const from = String(fromDate || '').trim().slice(0, 10);
-    const to = String(toDate || '').trim().slice(0, 10);
+    //   explicit dateField admit|leave|either wins
+    //   dateField none + Passout/Left/Transfer → Left Date (ldate)
+    //   dateField none + Active → Register Date (adate)
+    //   dateField none + no status → dates are not applied
+    const from = parseQueryDate(fromDate);
+    const to = parseQueryDate(toDate);
     const statusKey = status.trim().toUpperCase();
     const isAdmissionPeriod = statusKey === 'ADMISSION';
     const isWithdrawalPeriod =
@@ -330,31 +392,28 @@ export class RegistrationService implements OnModuleInit {
     const isEitherPeriod =
       statusKey === 'ADMISSION_OR_WITHDRAWAL' || statusKey === 'EITHER';
     const fieldRaw = String(dateField || '').trim().toLowerCase();
-    const skipDates = fieldRaw === 'none' || fieldRaw === 'off' || !fieldRaw;
     let periodKind: 'admit' | 'leave' | 'either' | 'none' = 'none';
-    if (skipDates) {
-      periodKind = 'none';
-    } else if (fieldRaw === 'leave' || fieldRaw === 'ldate' || fieldRaw === 'withdrawal') {
+    if (fieldRaw === 'leave' || fieldRaw === 'ldate' || fieldRaw === 'withdrawal') {
       periodKind = 'leave';
     } else if (fieldRaw === 'either' || fieldRaw === 'both') {
       periodKind = 'either';
     } else if (fieldRaw === 'admit' || fieldRaw === 'adate') {
       periodKind = 'admit';
+    } else if (fieldRaw === 'none' || fieldRaw === 'off' || !fieldRaw) {
+      periodKind = periodKindFromStatus(statusKey);
     }
-    const hasDateRange =
-      periodKind !== 'none' &&
-      (/^\d{4}-\d{2}-\d{2}$/.test(from) || /^\d{4}-\d{2}-\d{2}$/.test(to));
+    const hasDateRange = periodKind !== 'none' && Boolean(from || to);
     const useLeaveSort = periodKind === 'leave';
     const admitExpr = `left(coalesce(trim(st.adate::text), ''), 10)`;
     const leaveExpr = `left(coalesce(trim(st.ldate::text), ''), 10)`;
     const pushDateRange = (expr: string, target: string[], targetParams: unknown[]) => {
-      if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      if (from) {
         targetParams.push(from);
         target.push(
           `(${expr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${expr} >= $${targetParams.length})`,
         );
       }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      if (to) {
         targetParams.push(to);
         target.push(
           `(${expr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${expr} <= $${targetParams.length})`,
@@ -370,13 +429,13 @@ export class RegistrationService implements OnModuleInit {
     } else {
       const admitParts: string[] = [];
       const leaveParts: string[] = [];
-      if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      if (from) {
         params.push(from);
         const i = params.length;
         admitParts.push(`${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} >= $${i}`);
         leaveParts.push(`${leaveExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${leaveExpr} >= $${i}`);
       }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      if (to) {
         params.push(to);
         const i = params.length;
         admitParts.push(`${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} <= $${i}`);
@@ -502,20 +561,10 @@ export class RegistrationService implements OnModuleInit {
           break;
         }
         case 'admitDate':
-          params.push(`%${v}%`);
-          where.push(
-            `(coalesce(trim(st.adate), '') ILIKE $${params.length}
-              OR (trim(st.adate) ~ '^\\d{4}-\\d{2}-\\d{2}'
-                  AND to_char(left(trim(st.adate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
-          );
+          pushDateTextFilter(params, where, 'adate', v);
           break;
         case 'leftDate':
-          params.push(`%${v}%`);
-          where.push(
-            `(coalesce(trim(st.ldate), '') ILIKE $${params.length}
-              OR (trim(st.ldate) ~ '^\\d{4}-\\d{2}-\\d{2}'
-                  AND to_char(left(trim(st.ldate), 10)::date, 'DD Mon YYYY') ILIKE $${params.length}))`,
-          );
+          pushDateTextFilter(params, where, 'ldate', v);
           break;
         case 'admissionType':
           exact('trim(st.atyp)', v);

@@ -85,7 +85,7 @@ export class RegistrationController {
       colFilters,
       fromDate ?? '',
       toDate ?? '',
-      dateField ?? 'admit',
+      dateField ?? '',
     );
   }
 
