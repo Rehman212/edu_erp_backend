@@ -3609,6 +3609,123 @@ export class FinancialControlService {
   }
 
   /**
+   * One pass over the zone ledger. Profit & Loss, Balance Sheet, the monthly
+   * charts, and the cash balance used to each scan the same vouchers. The zone
+   * is about half of accdet, so another btree index does not replace that scan.
+   * dr/cr are numeric text with no dirty values, so the cast skips the regex.
+   */
+  private async loadFinalLedger(from: string, toExclusive: string, scope: string) {
+    const ledger = await this.database.withTransaction(async (client) => {
+      await client.query(`SET LOCAL work_mem = '64MB'`);
+      return client.query<{ code: string | null; ym: string | null; bucket: number; debit: string; credit: string }>(
+        `SELECT left(d.acode, 6) AS code,
+                left(m.invdate, 7) AS ym,
+                CASE WHEN m.invdate < $1 THEN 0 ELSE 1 END AS bucket,
+                sum(coalesce(nullif(d.dr, ''), '0')::numeric)::text AS debit,
+                sum(coalesce(nullif(d.cr, ''), '0')::numeric)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         GROUP BY 1, 2, 3`,
+        [from, toExclusive, scope],
+      );
+    });
+
+    const cents = (value: string) => Math.round((Number(value) || 0) * 100);
+    const money = (value: number) => (value / 100).toFixed(2);
+    const bump = (
+      map: Map<string, { a: string; b: string; dr: number; cr: number }>,
+      key: string,
+      a: string,
+      b: string,
+      dr: number,
+      cr: number,
+    ) => {
+      const cur = map.get(key) || { a, b, dr: 0, cr: 0 };
+      cur.dr += dr;
+      cur.cr += cr;
+      map.set(key, cur);
+    };
+    const moves = new Map<string, { a: string; b: string; dr: number; cr: number }>();
+    const months = new Map<string, { a: string; b: string; dr: number; cr: number }>();
+    const positions = new Map<string, { a: string; b: string; dr: number; cr: number }>();
+    const cash = new Map<string, { a: string; b: string; dr: number; cr: number }>();
+    let outsideDr = 0;
+    let outsideCr = 0;
+
+    for (const row of ledger.rows) {
+      const code = String(row.code || '');
+      const ym = String(row.ym || '');
+      const bucket = Number(row.bucket) === 0 ? 0 : 1;
+      const dr = cents(row.debit);
+      const cr = cents(row.credit);
+      const statement =
+        code.startsWith('11') ||
+        code.startsWith('15') ||
+        code.startsWith('21') ||
+        code.startsWith('22') ||
+        code.startsWith('31') ||
+        code.startsWith('33') ||
+        code.startsWith('41') ||
+        code.startsWith('42');
+      const grp = code.startsWith('11') || code.startsWith('15')
+        ? 'asset'
+        : code.startsWith('21')
+          ? 'equity'
+          : code.startsWith('22')
+            ? 'liab'
+            : code.startsWith('31') || code.startsWith('33')
+              ? 'income'
+              : code.startsWith('41') || code.startsWith('42')
+                ? 'expense'
+                : 'other';
+      if (statement) bump(moves, `${code}|${bucket}`, code, String(bucket), dr, cr);
+      else {
+        outsideDr += dr;
+        outsideCr += cr;
+      }
+      bump(positions, `${ym}|${grp}`, ym, grp, dr, cr);
+      const g2 = code.slice(0, 2);
+      if (bucket === 1 && (g2 === '31' || g2 === '33' || g2 === '41' || g2 === '42')) {
+        bump(months, `${ym}|${g2}`, ym, g2, dr, cr);
+      }
+      if (code.startsWith('1506')) bump(cash, ym, ym, '', dr, cr);
+    }
+
+    return {
+      moves: {
+        rows: [...moves.values()].map((row) => ({
+          code: row.a,
+          bucket: Number(row.b),
+          debit: money(row.dr),
+          credit: money(row.cr),
+        })),
+      },
+      outside: { rows: [{ debit: money(outsideDr), credit: money(outsideCr) }] },
+      months: {
+        rows: [...months.values()].map((row) => ({
+          ym: row.a,
+          grp: row.b,
+          debit: money(row.dr),
+          credit: money(row.cr),
+        })),
+      },
+      positions: {
+        rows: [...positions.values()].map((row) => ({
+          ym: row.a,
+          grp: row.b,
+          debit: money(row.dr),
+          credit: money(row.cr),
+        })),
+      },
+      cashMonths: {
+        rows: [...cash.values()].map((row) => ({ ym: row.a, net: money(row.dr - row.cr) })),
+      },
+    };
+  }
+
+  /**
    * Final accounts from the live ledger.
    * Profit & Loss is the selected period. The Balance Sheet is cumulative to the
    * period end. Earlier unclosed profit is brought forward so the sheet still balances.
@@ -3618,23 +3735,8 @@ export class FinancialControlService {
     const scope = await this.siteScope(username, site);
     const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
 
-    const [moves, heads, siteRow, outside, months, positions, cashMoves, cashMonths, studentRows] = await Promise.all([
-      this.database.query<{ code: string; bucket: number; debit: string; credit: string }>(
-        `SELECT left(trim(d.acode), 6) AS code,
-                CASE WHEN m.invdate < $1 THEN 0 ELSE 1 END AS bucket,
-                coalesce(sum(${this.debitSql}), 0)::text AS debit,
-                coalesce(sum(${this.creditSql}), 0)::text AS credit
-         FROM accdet d
-         JOIN accmast m ON m.invno = d.invno
-         WHERE m.invdate < $2
-           AND ($3 = '' OR m.ccode LIKE $3 || '%')
-           AND (
-             d.acode LIKE '11%' OR d.acode LIKE '15%' OR d.acode LIKE '21%' OR d.acode LIKE '22%'
-             OR d.acode LIKE '31%' OR d.acode LIKE '33%' OR d.acode LIKE '41%' OR d.acode LIKE '42%'
-           )
-         GROUP BY 1, 2`,
-        [from, toExclusive, scope],
-      ),
+    const [ledger, heads, siteRow, cashMoves, studentRows] = await Promise.all([
+      this.loadFinalLedger(from, toExclusive, scope),
       this.database.query<{ code: string; name: string }>(
         `SELECT trim(acode) AS code,
                 coalesce(nullif(trim(ahead), ''), trim(acode)) AS name
@@ -3649,55 +3751,6 @@ export class FinancialControlService {
             [scope],
           )
         : Promise.resolve({ rows: [] as { name: string }[] }),
-      this.database.query<{ debit: string; credit: string }>(
-        `SELECT coalesce(sum(${this.debitSql}), 0)::text AS debit,
-                coalesce(sum(${this.creditSql}), 0)::text AS credit
-         FROM accdet d
-         JOIN accmast m ON m.invno = d.invno
-         WHERE m.invdate < $1
-           AND ($2 = '' OR m.ccode LIKE $2 || '%')
-           AND NOT (
-             d.acode LIKE '11%' OR d.acode LIKE '15%' OR d.acode LIKE '21%' OR d.acode LIKE '22%'
-             OR d.acode LIKE '31%' OR d.acode LIKE '33%' OR d.acode LIKE '41%' OR d.acode LIKE '42%'
-           )`,
-        [toExclusive, scope],
-      ),
-      this.database.query<{ ym: string; grp: string; debit: string; credit: string }>(
-        `SELECT left(trim(m.invdate::text), 7) AS ym,
-                left(trim(d.acode), 2) AS grp,
-                coalesce(sum(${this.debitSql}), 0)::text AS debit,
-                coalesce(sum(${this.creditSql}), 0)::text AS credit
-         FROM accdet d
-         JOIN accmast m ON m.invno = d.invno
-         WHERE m.invdate >= $1
-           AND m.invdate < $2
-           AND ($3 = '' OR m.ccode LIKE $3 || '%')
-           AND (
-             d.acode LIKE '31%' OR d.acode LIKE '33%'
-             OR d.acode LIKE '41%' OR d.acode LIKE '42%'
-           )
-         GROUP BY 1, 2`,
-        [from, toExclusive, scope],
-      ),
-      this.database.query<{ ym: string; grp: string; debit: string; credit: string }>(
-        `SELECT left(trim(m.invdate::text), 7) AS ym,
-                CASE
-                  WHEN d.acode LIKE '11%' OR d.acode LIKE '15%' THEN 'asset'
-                  WHEN d.acode LIKE '21%' THEN 'equity'
-                  WHEN d.acode LIKE '22%' THEN 'liab'
-                  WHEN d.acode LIKE '31%' OR d.acode LIKE '33%' THEN 'income'
-                  WHEN d.acode LIKE '41%' OR d.acode LIKE '42%' THEN 'expense'
-                  ELSE 'other'
-                END AS grp,
-                coalesce(sum(${this.debitSql}), 0)::text AS debit,
-                coalesce(sum(${this.creditSql}), 0)::text AS credit
-         FROM accdet d
-         JOIN accmast m ON m.invno = d.invno
-         WHERE m.invdate < $1
-           AND ($2 = '' OR m.ccode LIKE $2 || '%')
-         GROUP BY 1, 2`,
-        [toExclusive, scope],
-      ),
       this.database.query<{ invno: string; head: string; debit: string; credit: string }>(
         `SELECT d.invno AS invno,
                 CASE WHEN d.acode LIKE '1506%' THEN '1506' ELSE left(trim(d.acode), 4) END AS head,
@@ -3717,17 +3770,6 @@ export class FinancialControlService {
            AND ($3 = '' OR m.ccode LIKE $3 || '%')
          GROUP BY 1, 2`,
         [from, toExclusive, scope],
-      ),
-      this.database.query<{ ym: string; net: string }>(
-        `SELECT left(trim(m.invdate::text), 7) AS ym,
-                coalesce(sum(${this.debitSql} - ${this.creditSql}), 0)::text AS net
-         FROM accdet d
-         JOIN accmast m ON m.invno = d.invno
-         WHERE m.invdate < $1
-           AND ($2 = '' OR m.ccode LIKE $2 || '%')
-           AND d.acode LIKE '1506%'
-         GROUP BY 1`,
-        [toExclusive, scope],
       ),
       this.database.query<{ sdno: string; name: string; income: string; expense: string }>(
         `SELECT coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
@@ -3752,6 +3794,7 @@ export class FinancialControlService {
       ),
     ]);
 
+    const { moves, outside, months, positions, cashMonths } = ledger;
     const nameMap = new Map(heads.rows.map((h) => [h.code, h.name]));
     const before = new Map<string, { dr: number; cr: number }>();
     const period = new Map<string, { dr: number; cr: number }>();
