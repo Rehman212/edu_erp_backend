@@ -287,6 +287,7 @@ export class RegistrationService implements OnModuleInit {
     colFilters: Record<string, string> = {},
     fromDate = '',
     toDate = '',
+    dateField = 'admit',
   ) {
     const scope = await this.siteScope(username, site);
     const size = Math.min(Math.max(Number(pageSize) || 50, 1), 1000);
@@ -316,16 +317,31 @@ export class RegistrationService implements OnModuleInit {
           OR coalesce(trim(st.sect), '') LIKE $${params.length})`,
       );
     }
-    // Date range (ISO yyyy-mm-dd).
-    // Cards: always admit/register date (adate).
-    // Table with Left/Passout/Transfer: leave date (ldate); else adate.
+    // Date range (ISO yyyy-mm-dd) — explicit period type (not tied to status):
+    // admit = Register/admission date (adate)
+    // leave = Withdrawal/left date (ldate) — Left / Passout / Transfer in period
+    // either = adate OR ldate in range
     const from = String(fromDate || '').trim().slice(0, 10);
     const to = String(toDate || '').trim().slice(0, 10);
     const statusKey = status.trim().toUpperCase();
-    const useLeaveDate =
-      statusKey === 'LEFT' ||
-      statusKey.startsWith('PASSOUT') ||
-      statusKey.startsWith('TRANSFER');
+    const isAdmissionPeriod = statusKey === 'ADMISSION';
+    const isWithdrawalPeriod =
+      statusKey === 'WITHDRAWAL' || statusKey === 'LEAVE';
+    const isEitherPeriod =
+      statusKey === 'ADMISSION_OR_WITHDRAWAL' || statusKey === 'EITHER';
+    const fieldRaw = String(dateField || 'admit').trim().toLowerCase();
+    const periodKind: 'admit' | 'leave' | 'either' = isWithdrawalPeriod
+      ? 'leave'
+      : isEitherPeriod || fieldRaw === 'either' || fieldRaw === 'both'
+        ? 'either'
+        : isAdmissionPeriod || fieldRaw === 'admit' || fieldRaw === 'adate'
+          ? 'admit'
+          : fieldRaw === 'leave' || fieldRaw === 'ldate' || fieldRaw === 'withdrawal'
+            ? 'leave'
+            : 'admit';
+    const hasDateRange =
+      /^\d{4}-\d{2}-\d{2}$/.test(from) || /^\d{4}-\d{2}-\d{2}$/.test(to);
+    const useLeaveSort = periodKind === 'leave';
     const admitExpr = `left(coalesce(trim(st.adate::text), ''), 10)`;
     const leaveExpr = `left(coalesce(trim(st.ldate::text), ''), 10)`;
     const pushDateRange = (expr: string, target: string[], targetParams: unknown[]) => {
@@ -342,15 +358,41 @@ export class RegistrationService implements OnModuleInit {
         );
       }
     };
-    // Shared scope uses admit date only when the table also filters by admit.
-    if (!useLeaveDate) {
+    if (!hasDateRange) {
+      // Period type alone does not narrow rows — needs From/To.
+    } else if (periodKind === 'admit') {
       pushDateRange(admitExpr, where, params);
+    } else if (periodKind === 'leave') {
+      pushDateRange(leaveExpr, where, params);
+    } else {
+      const admitParts: string[] = [];
+      const leaveParts: string[] = [];
+      if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+        params.push(from);
+        const i = params.length;
+        admitParts.push(`${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} >= $${i}`);
+        leaveParts.push(`${leaveExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${leaveExpr} >= $${i}`);
+      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+        params.push(to);
+        const i = params.length;
+        admitParts.push(`${admitExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${admitExpr} <= $${i}`);
+        leaveParts.push(`${leaveExpr} ~ '^\\d{4}-\\d{2}-\\d{2}' AND ${leaveExpr} <= $${i}`);
+      }
+      where.push(`((${admitParts.join(' AND ')}) OR (${leaveParts.join(' AND ')}))`);
+    }
+    const leaveStatusSql = `(upper(trim(coalesce(st.stat, ''))) = 'LEFT'
+      OR upper(trim(coalesce(st.stat, ''))) LIKE 'PASSOUT%'
+      OR upper(trim(coalesce(st.stat, ''))) LIKE 'TRANSFER%')`;
+    // Withdrawal is a real row filter (never Active), even without dates.
+    if (isWithdrawalPeriod) {
+      where.push(leaveStatusSql);
     }
     // Status filters the table only — summary cards stay a breakdown of the
     // current campus / class / section / search / date scope (without status).
     const statusWhere: string[] = [];
     const statusParams: unknown[] = [];
-    if (status.trim()) {
+    if (status.trim() && !isAdmissionPeriod && !isWithdrawalPeriod && !isEitherPeriod) {
       const s = statusKey;
       // DB may store Transfered / Transferred / Transfer — match all.
       if (s.startsWith('TRANSFER')) {
@@ -500,12 +542,9 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode`;
 
-    // Cards: always admit-date scoped (even when table uses leave date).
+    // Cards + table share the same period scope; status only narrows the table.
     const statsWhere = [...where];
     const statsParams = [...params];
-    if (useLeaveDate) {
-      pushDateRange(admitExpr, statsWhere, statsParams);
-    }
 
     const listWhere = [...where];
     const listParams = [...params];
@@ -516,9 +555,6 @@ export class RegistrationService implements OnModuleInit {
       } else {
         listWhere.push(clause);
       }
-    }
-    if (useLeaveDate) {
-      pushDateRange(leaveExpr, listWhere, listParams);
     }
 
     const count = await this.database.query<{
@@ -600,7 +636,7 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc c ON c.acode = st.ccode
        WHERE ${listWhere.join(' AND ')}
        ORDER BY ${
-         useLeaveDate
+         useLeaveSort
            ? `left(coalesce(st.ldate::text, ''), 10) DESC NULLS LAST,
                 st.row_id DESC NULLS LAST,
                 st.name`

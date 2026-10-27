@@ -62,6 +62,7 @@ export class RegistrationController {
     @Query('q') q?: string,
     @Query('fromDate') fromDate?: string,
     @Query('toDate') toDate?: string,
+    @Query('dateField') dateField?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
     @Query() all?: Record<string, string>,
@@ -84,6 +85,7 @@ export class RegistrationController {
       colFilters,
       fromDate ?? '',
       toDate ?? '',
+      dateField ?? 'admit',
     );
   }
 
