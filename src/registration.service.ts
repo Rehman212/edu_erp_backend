@@ -317,10 +317,10 @@ export class RegistrationService implements OnModuleInit {
           OR coalesce(trim(st.sect), '') LIKE $${params.length})`,
       );
     }
-    // Date range (ISO yyyy-mm-dd) — explicit period type (not tied to status):
-    // admit = Register/admission date (adate)
-    // leave = Withdrawal/left date (ldate) — Left / Passout / Transfer in period
-    // either = adate OR ldate in range
+    // Date range column:
+    //   Active / Admission / empty → Register Date (adate)
+    //   Left / Passout / Transfer / Withdrawal → Left Date (ldate)
+    //   dateField query can still force admit|leave|either
     const from = String(fromDate || '').trim().slice(0, 10);
     const to = String(toDate || '').trim().slice(0, 10);
     const statusKey = status.trim().toUpperCase();
@@ -329,18 +329,21 @@ export class RegistrationService implements OnModuleInit {
       statusKey === 'WITHDRAWAL' || statusKey === 'LEAVE';
     const isEitherPeriod =
       statusKey === 'ADMISSION_OR_WITHDRAWAL' || statusKey === 'EITHER';
-    const fieldRaw = String(dateField || 'admit').trim().toLowerCase();
-    const periodKind: 'admit' | 'leave' | 'either' = isWithdrawalPeriod
-      ? 'leave'
-      : isEitherPeriod || fieldRaw === 'either' || fieldRaw === 'both'
-        ? 'either'
-        : isAdmissionPeriod || fieldRaw === 'admit' || fieldRaw === 'adate'
-          ? 'admit'
-          : fieldRaw === 'leave' || fieldRaw === 'ldate' || fieldRaw === 'withdrawal'
-            ? 'leave'
-            : 'admit';
+    const fieldRaw = String(dateField || '').trim().toLowerCase();
+    const skipDates = fieldRaw === 'none' || fieldRaw === 'off' || !fieldRaw;
+    let periodKind: 'admit' | 'leave' | 'either' | 'none' = 'none';
+    if (skipDates) {
+      periodKind = 'none';
+    } else if (fieldRaw === 'leave' || fieldRaw === 'ldate' || fieldRaw === 'withdrawal') {
+      periodKind = 'leave';
+    } else if (fieldRaw === 'either' || fieldRaw === 'both') {
+      periodKind = 'either';
+    } else if (fieldRaw === 'admit' || fieldRaw === 'adate') {
+      periodKind = 'admit';
+    }
     const hasDateRange =
-      /^\d{4}-\d{2}-\d{2}$/.test(from) || /^\d{4}-\d{2}-\d{2}$/.test(to);
+      periodKind !== 'none' &&
+      (/^\d{4}-\d{2}-\d{2}$/.test(from) || /^\d{4}-\d{2}-\d{2}$/.test(to));
     const useLeaveSort = periodKind === 'leave';
     const admitExpr = `left(coalesce(trim(st.adate::text), ''), 10)`;
     const leaveExpr = `left(coalesce(trim(st.ldate::text), ''), 10)`;
