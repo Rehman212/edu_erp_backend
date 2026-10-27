@@ -3920,7 +3920,7 @@ export class FinancialControlService {
     }> = [];
     const cursor = new Date(`${from.slice(0, 7)}-01T00:00:00`);
     const endMonth = new Date(`${to.slice(0, 7)}-01T00:00:00`);
-    while (cursor <= endMonth && monthly.length < 60) {
+    while (cursor <= endMonth && monthly.length < 240) {
       const ym = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
       const slot = byMonth.get(ym) || { income: 0, expense: 0, other: 0 };
       monthly.push({
@@ -3976,7 +3976,7 @@ export class FinancialControlService {
     }> = [];
     const positionCursor = new Date(`${from.slice(0, 7)}-01T00:00:00`);
     const positionEnd = new Date(`${to.slice(0, 7)}-01T00:00:00`);
-    while (positionCursor <= positionEnd && balanceMonthly.length < 60) {
+    while (positionCursor <= positionEnd && balanceMonthly.length < 240) {
       const ym = `${positionCursor.getFullYear()}-${String(positionCursor.getMonth() + 1).padStart(2, '0')}`;
       while (positionIndex < positionKeys.length && positionKeys[positionIndex] <= ym) {
         const slot = positionSlots.get(positionKeys[positionIndex]);
@@ -4048,7 +4048,7 @@ export class FinancialControlService {
     let cashRunning = cashBefore;
     const cashCursor = new Date(`${fromMonth}-01T00:00:00`);
     const cashEnd = new Date(`${to.slice(0, 7)}-01T00:00:00`);
-    while (cashCursor <= cashEnd && cashMonthly.length < 60) {
+    while (cashCursor <= cashEnd && cashMonthly.length < 240) {
       const ym = `${cashCursor.getFullYear()}-${String(cashCursor.getMonth() + 1).padStart(2, '0')}`;
       cashRunning += cashMonthNet.get(ym) || 0;
       cashMonthly.push({ month: ym, balance: round2(cashRunning) });
