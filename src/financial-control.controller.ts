@@ -33,6 +33,16 @@ export class FinancialControlController {
     return this.finance.accounts(q ?? '', Number(limit) || 80, scope ?? '');
   }
 
+  @Get('final-accounts')
+  finalAccounts(
+    @Headers('x-ess-user') user: string | undefined,
+    @Query('site') site?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
+  ) {
+    return this.finance.finalAccounts(user ?? '', site ?? '', fromDate ?? '', toDate ?? '');
+  }
+
   @Get('trial-balance')
   trialBalance(
     @Headers('x-ess-user') user: string | undefined,

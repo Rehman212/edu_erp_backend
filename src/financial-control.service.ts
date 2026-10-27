@@ -13,6 +13,13 @@ export type TbNode = {
   children: TbNode[];
 };
 
+export type FaLine = {
+  code: string;
+  name: string;
+  amount: number;
+  lines: FaLine[];
+};
+
 /** Avoid trim() on join/filter columns — it disables btree indexes (was ~3s → ~0.4s). */
 const NUM = (alias: string, col: string) =>
   `CASE WHEN coalesce(${alias}.${col}, '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ${alias}.${col}::numeric ELSE 0 END`;
@@ -3601,6 +3608,524 @@ export class FinancialControlService {
     return out;
   }
 
+  /**
+   * Final accounts from the live ledger.
+   * Profit & Loss is the selected period. The Balance Sheet is cumulative to the
+   * period end. Earlier unclosed profit is brought forward so the sheet still balances.
+   * Campus masters (14) and definition heads (13) are not statement accounts.
+   */
+  async finalAccounts(username: string, site: string, fromDate: string, toDate: string) {
+    const scope = await this.siteScope(username, site);
+    const { from, to, toExclusive } = this.periodBounds(fromDate, toDate);
+
+    const [moves, heads, siteRow, outside, months, positions, cashMoves, cashMonths, studentRows] = await Promise.all([
+      this.database.query<{ code: string; bucket: number; debit: string; credit: string }>(
+        `SELECT left(trim(d.acode), 6) AS code,
+                CASE WHEN m.invdate < $1 THEN 0 ELSE 1 END AS bucket,
+                coalesce(sum(${this.debitSql}), 0)::text AS debit,
+                coalesce(sum(${this.creditSql}), 0)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND (
+             d.acode LIKE '11%' OR d.acode LIKE '15%' OR d.acode LIKE '21%' OR d.acode LIKE '22%'
+             OR d.acode LIKE '31%' OR d.acode LIKE '33%' OR d.acode LIKE '41%' OR d.acode LIKE '42%'
+           )
+         GROUP BY 1, 2`,
+        [from, toExclusive, scope],
+      ),
+      this.database.query<{ code: string; name: string }>(
+        `SELECT trim(acode) AS code,
+                coalesce(nullif(trim(ahead), ''), trim(acode)) AS name
+         FROM acc
+         WHERE length(trim(acode)) IN (2, 4, 6)
+           AND left(trim(acode), 2) IN ('11','15','21','22','31','33','41','42')`,
+      ),
+      scope
+        ? this.database.query<{ name: string }>(
+            `SELECT coalesce(nullif(trim(ahead), ''), trim(acode)) AS name
+             FROM acc WHERE trim(acode) = $1 LIMIT 1`,
+            [scope],
+          )
+        : Promise.resolve({ rows: [] as { name: string }[] }),
+      this.database.query<{ debit: string; credit: string }>(
+        `SELECT coalesce(sum(${this.debitSql}), 0)::text AS debit,
+                coalesce(sum(${this.creditSql}), 0)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate < $1
+           AND ($2 = '' OR m.ccode LIKE $2 || '%')
+           AND NOT (
+             d.acode LIKE '11%' OR d.acode LIKE '15%' OR d.acode LIKE '21%' OR d.acode LIKE '22%'
+             OR d.acode LIKE '31%' OR d.acode LIKE '33%' OR d.acode LIKE '41%' OR d.acode LIKE '42%'
+           )`,
+        [toExclusive, scope],
+      ),
+      this.database.query<{ ym: string; grp: string; debit: string; credit: string }>(
+        `SELECT left(trim(m.invdate::text), 7) AS ym,
+                left(trim(d.acode), 2) AS grp,
+                coalesce(sum(${this.debitSql}), 0)::text AS debit,
+                coalesce(sum(${this.creditSql}), 0)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate >= $1
+           AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND (
+             d.acode LIKE '31%' OR d.acode LIKE '33%'
+             OR d.acode LIKE '41%' OR d.acode LIKE '42%'
+           )
+         GROUP BY 1, 2`,
+        [from, toExclusive, scope],
+      ),
+      this.database.query<{ ym: string; grp: string; debit: string; credit: string }>(
+        `SELECT left(trim(m.invdate::text), 7) AS ym,
+                CASE
+                  WHEN d.acode LIKE '11%' OR d.acode LIKE '15%' THEN 'asset'
+                  WHEN d.acode LIKE '21%' THEN 'equity'
+                  WHEN d.acode LIKE '22%' THEN 'liab'
+                  WHEN d.acode LIKE '31%' OR d.acode LIKE '33%' THEN 'income'
+                  WHEN d.acode LIKE '41%' OR d.acode LIKE '42%' THEN 'expense'
+                  ELSE 'other'
+                END AS grp,
+                coalesce(sum(${this.debitSql}), 0)::text AS debit,
+                coalesce(sum(${this.creditSql}), 0)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate < $1
+           AND ($2 = '' OR m.ccode LIKE $2 || '%')
+         GROUP BY 1, 2`,
+        [toExclusive, scope],
+      ),
+      this.database.query<{ invno: string; head: string; debit: string; credit: string }>(
+        `SELECT d.invno AS invno,
+                CASE WHEN d.acode LIKE '1506%' THEN '1506' ELSE left(trim(d.acode), 4) END AS head,
+                coalesce(sum(${this.debitSql}), 0)::text AS debit,
+                coalesce(sum(${this.creditSql}), 0)::text AS credit
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         JOIN (
+           SELECT DISTINCT d2.invno
+           FROM accdet d2
+           JOIN accmast m2 ON m2.invno = d2.invno
+           WHERE m2.invdate >= $1 AND m2.invdate < $2
+             AND ($3 = '' OR m2.ccode LIKE $3 || '%')
+             AND d2.acode LIKE '1506%'
+         ) cashinv ON cashinv.invno = d.invno
+         WHERE m.invdate >= $1 AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+         GROUP BY 1, 2`,
+        [from, toExclusive, scope],
+      ),
+      this.database.query<{ ym: string; net: string }>(
+        `SELECT left(trim(m.invdate::text), 7) AS ym,
+                coalesce(sum(${this.debitSql} - ${this.creditSql}), 0)::text AS net
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         WHERE m.invdate < $1
+           AND ($2 = '' OR m.ccode LIKE $2 || '%')
+           AND d.acode LIKE '1506%'
+         GROUP BY 1`,
+        [toExclusive, scope],
+      ),
+      this.database.query<{ sdno: string; name: string; income: string; expense: string }>(
+        `SELECT coalesce(nullif(trim(m.sdno), ''), '') AS sdno,
+                coalesce(max(nullif(trim(st.name), '')), '') AS name,
+                coalesce(sum(CASE
+                  WHEN d.acode LIKE '31%' OR d.acode LIKE '33%' THEN ${this.creditSql} - ${this.debitSql}
+                  ELSE 0 END), 0)::text AS income,
+                coalesce(sum(CASE
+                  WHEN d.acode LIKE '41%' OR d.acode LIKE '42%' THEN ${this.debitSql} - ${this.creditSql}
+                  ELSE 0 END), 0)::text AS expense
+         FROM accdet d
+         JOIN accmast m ON m.invno = d.invno
+         LEFT JOIN student st ON st.sdno = m.sdno
+         WHERE m.invdate >= $1 AND m.invdate < $2
+           AND ($3 = '' OR m.ccode LIKE $3 || '%')
+           AND (
+             d.acode LIKE '31%' OR d.acode LIKE '33%'
+             OR d.acode LIKE '41%' OR d.acode LIKE '42%'
+           )
+         GROUP BY 1`,
+        [from, toExclusive, scope],
+      ),
+    ]);
+
+    const nameMap = new Map(heads.rows.map((h) => [h.code, h.name]));
+    const before = new Map<string, { dr: number; cr: number }>();
+    const period = new Map<string, { dr: number; cr: number }>();
+
+    const add = (map: Map<string, { dr: number; cr: number }>, code: string, dr: number, cr: number) => {
+      const keys = new Set<string>();
+      if (code.length >= 2) keys.add(code.slice(0, 2));
+      if (code.length >= 4) keys.add(code.slice(0, 4));
+      if (code.length >= 6) keys.add(code.slice(0, 6));
+      for (const key of keys) {
+        const cur = map.get(key) || { dr: 0, cr: 0 };
+        cur.dr += dr;
+        cur.cr += cr;
+        map.set(key, cur);
+      }
+    };
+
+    for (const row of moves.rows) {
+      const code = String(row.code || '').trim();
+      if (!code) continue;
+      const dr = Number(row.debit) || 0;
+      const cr = Number(row.credit) || 0;
+      add(Number(row.bucket) === 0 ? before : period, code, dr, cr);
+    }
+
+    const known = new Set<string>([...nameMap.keys(), ...before.keys(), ...period.keys()]);
+
+    const amountOf = (code: string, side: 'dr' | 'cr', source: 'period' | 'cum') => {
+      const parts = source === 'period' ? [period] : [before, period];
+      let dr = 0;
+      let cr = 0;
+      for (const map of parts) {
+        const hit = map.get(code);
+        if (!hit) continue;
+        dr += hit.dr;
+        cr += hit.cr;
+      }
+      return round2(side === 'dr' ? dr - cr : cr - dr);
+    };
+
+    const build = (code: string, side: 'dr' | 'cr', source: 'period' | 'cum'): FaLine => {
+      const childLen = code.length === 2 ? 4 : code.length === 4 ? 6 : 0;
+      const lines: FaLine[] = [];
+      if (childLen) {
+        const children = [...known]
+          .filter((c) => c.length === childLen && c.startsWith(code))
+          .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        for (const child of children) {
+          const line = build(child, side, source);
+          if (line.amount !== 0 || line.lines.length) lines.push(line);
+        }
+      }
+      const amount = amountOf(code, side, source);
+      const childSum = round2(lines.reduce((sum, line) => sum + line.amount, 0));
+      const gap = round2(amount - childSum);
+      if (lines.length && Math.abs(gap) >= 0.01) {
+        lines.push({ code: '', name: 'Other', amount: gap, lines: [] });
+      }
+      return {
+        code,
+        name: nameMap.get(code) || code,
+        amount,
+        lines,
+      };
+    };
+
+    const section = (codes: string[], side: 'dr' | 'cr', source: 'period' | 'cum') =>
+      codes
+        .map((code) => build(code, side, source))
+        .filter((line) => line.amount !== 0 || line.lines.length);
+
+    const sumLines = (lines: FaLine[]) => round2(lines.reduce((sum, line) => sum + line.amount, 0));
+
+    const income = section(['31', '33'], 'cr', 'period');
+    const expenses = section(['41', '42'], 'dr', 'period');
+    const totalIncome = sumLines(income);
+    const totalExpenses = sumLines(expenses);
+    const netProfit = round2(totalIncome - totalExpenses);
+
+    const incomeBefore = round2(amountOf('31', 'cr', 'cum') - amountOf('31', 'cr', 'period') + amountOf('33', 'cr', 'cum') - amountOf('33', 'cr', 'period'));
+    const expenseBefore = round2(amountOf('41', 'dr', 'cum') - amountOf('41', 'dr', 'period') + amountOf('42', 'dr', 'cum') - amountOf('42', 'dr', 'period'));
+    const broughtForward = round2(incomeBefore - expenseBefore);
+
+    const assets = section(['11', '15'], 'dr', 'cum');
+    const equity = section(['21'], 'cr', 'cum');
+    const liabilities = section(['22'], 'cr', 'cum');
+    const unclassified = round2((Number(outside.rows[0]?.debit) || 0) - (Number(outside.rows[0]?.credit) || 0));
+    if (unclassified >= 0.01) {
+      assets.push({ code: '', name: 'Unclassified balances', amount: unclassified, lines: [] });
+    } else if (unclassified <= -0.01) {
+      liabilities.push({
+        code: '',
+        name: 'Unclassified balances',
+        amount: round2(-unclassified),
+        lines: [],
+      });
+    }
+    const totalAssets = sumLines(assets);
+    const totalLiabilities = sumLines(liabilities);
+    const totalEquity = round2(sumLines(equity) + broughtForward + netProfit);
+    const totalEquityAndLiabilities = round2(totalEquity + totalLiabilities);
+    const difference = round2(totalAssets - totalEquityAndLiabilities);
+
+    const byMonth = new Map<string, { income: number; expense: number; other: number }>();
+    for (const row of months.rows) {
+      const ym = String(row.ym || '').slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(ym)) continue;
+      const slot = byMonth.get(ym) || { income: 0, expense: 0, other: 0 };
+      const dr = Number(row.debit) || 0;
+      const cr = Number(row.credit) || 0;
+      const grp = String(row.grp || '');
+      if (grp === '31' || grp === '33') slot.income += cr - dr;
+      if (grp === '33') slot.other += cr - dr;
+      if (grp === '41' || grp === '42') slot.expense += dr - cr;
+      byMonth.set(ym, slot);
+    }
+    const monthly: Array<{
+      month: string;
+      income: number;
+      expense: number;
+      otherRevenue: number;
+      netProfit: number;
+    }> = [];
+    const cursor = new Date(`${from.slice(0, 7)}-01T00:00:00`);
+    const endMonth = new Date(`${to.slice(0, 7)}-01T00:00:00`);
+    while (cursor <= endMonth && monthly.length < 60) {
+      const ym = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
+      const slot = byMonth.get(ym) || { income: 0, expense: 0, other: 0 };
+      monthly.push({
+        month: ym,
+        income: round2(slot.income),
+        expense: round2(slot.expense),
+        otherRevenue: round2(slot.other),
+        netProfit: round2(slot.income - slot.expense),
+      });
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+
+    const positionSlots = new Map<
+      string,
+      { asset: number; equity: number; liab: number; income: number; expense: number; other: number }
+    >();
+    const positionOpening = { asset: 0, equity: 0, liab: 0, income: 0, expense: 0, other: 0 };
+    const addPosition = (
+      slot: typeof positionOpening,
+      grp: string,
+      dr: number,
+      cr: number,
+    ) => {
+      if (grp === 'asset') slot.asset += dr - cr;
+      else if (grp === 'equity') slot.equity += cr - dr;
+      else if (grp === 'liab') slot.liab += cr - dr;
+      else if (grp === 'income') slot.income += cr - dr;
+      else if (grp === 'expense') slot.expense += dr - cr;
+      else slot.other += dr - cr;
+    };
+    for (const row of positions.rows) {
+      const ym = String(row.ym || '').slice(0, 7);
+      const dr = Number(row.debit) || 0;
+      const cr = Number(row.credit) || 0;
+      const grp = String(row.grp || '');
+      if (!/^\d{4}-\d{2}$/.test(ym)) {
+        addPosition(positionOpening, grp, dr, cr);
+        continue;
+      }
+      const slot = positionSlots.get(ym) || { asset: 0, equity: 0, liab: 0, income: 0, expense: 0, other: 0 };
+      addPosition(slot, grp, dr, cr);
+      positionSlots.set(ym, slot);
+    }
+    const positionRunning = { ...positionOpening };
+    const positionKeys = [...positionSlots.keys()].sort();
+    let positionIndex = 0;
+    const balanceMonthly: Array<{
+      month: string;
+      assets: number;
+      liabilities: number;
+      equity: number;
+      difference: number;
+    }> = [];
+    const positionCursor = new Date(`${from.slice(0, 7)}-01T00:00:00`);
+    const positionEnd = new Date(`${to.slice(0, 7)}-01T00:00:00`);
+    while (positionCursor <= positionEnd && balanceMonthly.length < 60) {
+      const ym = `${positionCursor.getFullYear()}-${String(positionCursor.getMonth() + 1).padStart(2, '0')}`;
+      while (positionIndex < positionKeys.length && positionKeys[positionIndex] <= ym) {
+        const slot = positionSlots.get(positionKeys[positionIndex]);
+        if (slot) {
+          positionRunning.asset += slot.asset;
+          positionRunning.equity += slot.equity;
+          positionRunning.liab += slot.liab;
+          positionRunning.income += slot.income;
+          positionRunning.expense += slot.expense;
+          positionRunning.other += slot.other;
+        }
+        positionIndex += 1;
+      }
+      const unclassified = positionRunning.other;
+      const assetsBal = positionRunning.asset + (unclassified >= 0.01 ? unclassified : 0);
+      const liabilitiesBal = positionRunning.liab + (unclassified <= -0.01 ? -unclassified : 0);
+      const equityBal = positionRunning.equity + positionRunning.income - positionRunning.expense;
+      balanceMonthly.push({
+        month: ym,
+        assets: round2(assetsBal),
+        liabilities: round2(liabilitiesBal),
+        equity: round2(equityBal),
+        difference: round2(assetsBal - equityBal - liabilitiesBal),
+      });
+      positionCursor.setMonth(positionCursor.getMonth() + 1);
+    }
+
+    const flow = allocateCash(cashMoves.rows);
+    const flowNames = new Map(nameMap);
+    const missingHeads = [...flow.keys()].filter((head) => head !== 'unclassified' && !flowNames.has(head));
+    if (missingHeads.length) {
+      const named = await this.database.query<{ code: string; name: string }>(
+        `SELECT trim(acode) AS code, coalesce(nullif(trim(ahead), ''), trim(acode)) AS name
+         FROM acc WHERE trim(acode) = ANY($1::text[])`,
+        [missingHeads],
+      );
+      for (const row of named.rows) flowNames.set(row.code, row.name);
+    }
+    const sectionLines = (section: 'operating' | 'investing' | 'financing') =>
+      [...flow.entries()]
+        .filter(([head, amount]) => cashSection(head) === section && Math.abs(amount) >= 0.01)
+        .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+        .map(([head, amount]) => ({
+          code: head === 'unclassified' ? '' : head,
+          name: head === 'unclassified' ? 'Cash movement without a contra account' : flowNames.get(head) || head,
+          amount: round2(amount),
+          lines: [] as FaLine[],
+        }));
+    const operatingLines = sectionLines('operating');
+    const investingLines = sectionLines('investing');
+    const financingLines = sectionLines('financing');
+    const flowNet = round2([...flow.values()].reduce((sum, amount) => sum + amount, 0));
+    let cashBefore = 0;
+    const cashMonthNet = new Map<string, number>();
+    for (const row of cashMonths.rows) {
+      const ym = String(row.ym || '').slice(0, 7);
+      const net = Number(row.net) || 0;
+      if (!/^\d{4}-\d{2}$/.test(ym)) {
+        cashBefore += net;
+        continue;
+      }
+      cashMonthNet.set(ym, (cashMonthNet.get(ym) || 0) + net);
+    }
+    const fromMonth = from.slice(0, 7);
+    for (const [ym, net] of cashMonthNet) {
+      if (ym < fromMonth) cashBefore += net;
+    }
+    const cashMonthly: Array<{ month: string; balance: number }> = [];
+    let cashRunning = cashBefore;
+    const cashCursor = new Date(`${fromMonth}-01T00:00:00`);
+    const cashEnd = new Date(`${to.slice(0, 7)}-01T00:00:00`);
+    while (cashCursor <= cashEnd && cashMonthly.length < 60) {
+      const ym = `${cashCursor.getFullYear()}-${String(cashCursor.getMonth() + 1).padStart(2, '0')}`;
+      cashRunning += cashMonthNet.get(ym) || 0;
+      cashMonthly.push({ month: ym, balance: round2(cashRunning) });
+      cashCursor.setMonth(cashCursor.getMonth() + 1);
+    }
+    const openingCash = round2(cashBefore);
+    const closingCash = cashMonthly.length ? cashMonthly[cashMonthly.length - 1].balance : openingCash;
+    const cashLines = [
+      { code: 'operating', name: 'Cash flows from operating activities', amount: round2(operatingLines.reduce((sum, line) => sum + line.amount, 0)), lines: operatingLines },
+      { code: 'investing', name: 'Cash flows from investing activities', amount: round2(investingLines.reduce((sum, line) => sum + line.amount, 0)), lines: investingLines },
+      { code: 'financing', name: 'Cash flows from financing activities', amount: round2(financingLines.reduce((sum, line) => sum + line.amount, 0)), lines: financingLines },
+    ].filter((line) => line.lines.length || Math.abs(line.amount) >= 0.01);
+
+    const taggedStudents = studentRows.rows.filter((row) => row.sdno);
+    const studentInfo = taggedStudents.map((row) => ({
+      sdno: row.sdno,
+      studentName: row.name,
+      income: Number(row.income) || 0,
+      expense: Number(row.expense) || 0,
+      classCode: '',
+      className: '',
+    }));
+    await this.withClassSection(studentInfo);
+    const byClass = new Map<string, FaLine>();
+    for (const row of studentInfo) {
+      const amount = round2(row.income - row.expense);
+      if (Math.abs(amount) < 0.01) continue;
+      const key = row.classCode || row.className || 'none';
+      const group = byClass.get(key) || {
+        code: row.classCode || '',
+        name: row.className || 'No class',
+        amount: 0,
+        lines: [],
+      };
+      group.lines.push({
+        code: row.sdno,
+        name: row.studentName ? `${row.studentName} (${row.sdno})` : row.sdno,
+        amount,
+        lines: [],
+      });
+      group.amount = round2(group.amount + amount);
+      byClass.set(key, group);
+    }
+    const classLines = [...byClass.values()]
+      .map((group) => ({
+        ...group,
+        lines: group.lines.sort((a, b) => a.name.localeCompare(b.name)),
+      }))
+      .sort((a, b) => (a.code || a.name).localeCompare(b.code || b.name, undefined, { numeric: true }));
+    const studentIncome = round2(studentInfo.reduce((sum, row) => sum + row.income, 0));
+    const untagged = studentRows.rows.find((row) => !row.sdno);
+    const untaggedIncome = round2(Number(untagged?.income) || 0);
+    const campusExpenses = round2(Number(untagged?.expense) || 0);
+    const studentLines: FaLine[] = [];
+    if (classLines.length) {
+      studentLines.push({
+        code: 'student-income',
+        name: 'Fee income by student',
+        amount: round2(classLines.reduce((sum, line) => sum + line.amount, 0)),
+        lines: classLines,
+      });
+    }
+    if (Math.abs(untaggedIncome) >= 0.01) {
+      studentLines.push({
+        code: 'untagged-income',
+        name: 'Income not linked to a student',
+        amount: untaggedIncome,
+        lines: [],
+      });
+    }
+    if (Math.abs(campusExpenses) >= 0.01) {
+      studentLines.push({
+        code: 'campus-expense',
+        name: 'Campus expenses not linked to a student',
+        amount: campusExpenses,
+        lines: [],
+      });
+    }
+    const classTotal = round2(classLines.reduce((sum, line) => sum + line.amount, 0));
+    const studentNet = round2(classTotal + untaggedIncome - campusExpenses);
+
+    return {
+      profitAndLoss: { income, expenses, totalIncome, totalExpenses, netProfit, monthly },
+      balanceSheet: {
+        assets,
+        equity,
+        liabilities,
+        broughtForward,
+        profitForPeriod: netProfit,
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        totalEquityAndLiabilities,
+        difference,
+        monthly: balanceMonthly,
+      },
+      cashFlow: {
+        opening: openingCash,
+        closing: closingCash,
+        netIncrease: round2(closingCash - openingCash),
+        flowNet,
+        lines: cashLines,
+        monthly: cashMonthly,
+      },
+      student: {
+        lines: studentLines,
+        studentIncome,
+        untaggedIncome,
+        campusExpenses,
+        net: studentNet,
+      },
+      meta: {
+        site: scope,
+        siteName: siteRow.rows[0]?.name || (scope ? scope : 'All zones'),
+        fromDate: from,
+        toDate: to,
+      },
+    };
+  }
+
   private async siteScope(username: string, site: string) {
     const zone = await this.zonePrefix(username);
     let code = site.trim();
@@ -3709,6 +4234,59 @@ export class FinancialControlService {
     const day = String(d.getUTCDate()).padStart(2, '0');
     return `${y}-${m}-${day}`;
   }
+}
+
+function cashSection(head: string): 'operating' | 'investing' | 'financing' {
+  if (head.startsWith('11')) return 'investing';
+  if (head.startsWith('21') || head.startsWith('2201')) return 'financing';
+  return 'operating';
+}
+
+function allocateCash(rows: { invno: string; head: string; debit: string; credit: string }[]) {
+  const byInv = new Map<string, { cashDr: number; cashCr: number; contra: { head: string; dr: number; cr: number }[] }>();
+  for (const row of rows) {
+    const slot = byInv.get(row.invno) || { cashDr: 0, cashCr: 0, contra: [] };
+    const dr = Number(row.debit) || 0;
+    const cr = Number(row.credit) || 0;
+    if (row.head === '1506') {
+      slot.cashDr += dr;
+      slot.cashCr += cr;
+    } else if (row.head) {
+      slot.contra.push({ head: row.head, dr, cr });
+    }
+    byInv.set(row.invno, slot);
+  }
+  const flow = new Map<string, number>();
+  const add = (head: string, amount: number) => {
+    if (Math.abs(amount) < 0.004) return;
+    flow.set(head, round2((flow.get(head) || 0) + amount));
+  };
+  for (const slot of byInv.values()) {
+    const net = round2(slot.cashDr - slot.cashCr);
+    if (Math.abs(net) < 0.005) continue;
+    if (!slot.contra.length) {
+      add('unclassified', net);
+      continue;
+    }
+    const inflow = net > 0;
+    const preferred = slot.contra.filter((line) => (inflow ? line.cr : line.dr) > 0.004);
+    const base = preferred.length ? preferred : slot.contra;
+    const weights = base.map((line) =>
+      preferred.length ? (inflow ? line.cr : line.dr) : Math.max(Math.abs(line.dr - line.cr), 0.01),
+    );
+    const weight = weights.reduce((sum, value) => sum + value, 0);
+    if (weight < 0.004) {
+      add('unclassified', net);
+      continue;
+    }
+    let used = 0;
+    base.forEach((line, index) => {
+      const share = index === base.length - 1 ? round2(net - used) : round2(net * (weights[index] / weight));
+      used = round2(used + share);
+      add(line.head, share);
+    });
+  }
+  return flow;
 }
 
 function round2(n: number) {
