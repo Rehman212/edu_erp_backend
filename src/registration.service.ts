@@ -599,9 +599,15 @@ export class RegistrationService implements OnModuleInit {
        LEFT JOIN acc se ON se.acode = coalesce(nullif(trim(st.sec), ''), nullif(trim(st.sect), ''))
        LEFT JOIN acc c ON c.acode = st.ccode
        WHERE ${listWhere.join(' AND ')}
-       ORDER BY st.row_id DESC NULLS LAST,
+       ORDER BY ${
+         useLeaveDate
+           ? `left(coalesce(st.ldate::text, ''), 10) DESC NULLS LAST,
+                st.row_id DESC NULLS LAST,
+                st.name`
+           : `st.row_id DESC NULLS LAST,
                 left(coalesce(st.adate::text, ''), 10) DESC NULLS LAST,
-                st.name
+                st.name`
+       }
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
       [...listParams, size, offset],
     );
