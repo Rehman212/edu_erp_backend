@@ -12,6 +12,21 @@ function leftDate(v: unknown): string {
   return s.length >= 10 ? s.slice(0, 10) : s;
 }
 
+function todayIso(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** Left status always keeps a left date. An empty date becomes today. */
+function leftDateForStatus(status: unknown, rawLeft: unknown): string | null {
+  const date = leftDate(rawLeft) || null;
+  if (String(status || '').trim().toUpperCase() === 'LEFT' && !date) return todayIso();
+  return date;
+}
+
 /** Query dates may arrive as YYYY-MM-DD or DD/MM/YYYY. Invalid values are ignored. */
 function parseQueryDate(value: unknown): string {
   const s = String(value ?? '').trim();
@@ -901,7 +916,7 @@ export class RegistrationService implements OnModuleInit {
         String(body.status || body.stat || 'Active').trim() || 'Active',
         String(body.admissionType || body.atyp || '').trim() || null,
         leftDate(body.admitDate || body.adate) || null,
-        leftDate(body.leftDate || body.ldate) || null,
+        leftDateForStatus(body.status || body.stat || 'Active', body.leftDate || body.ldate),
         leftDate(body.joinDate || body.dpj) || null,
         String(moneyNum(body.admissionFee ?? body.adfee)),
         String(moneyNum(body.registrationFee ?? body.regfee)),
@@ -1021,7 +1036,11 @@ export class RegistrationService implements OnModuleInit {
       set('adate', leftDate(body.admitDate || body.adate) || null);
     }
     if (body.leftDate !== undefined || body.ldate !== undefined) {
-      set('ldate', leftDate(body.leftDate || body.ldate) || null);
+      const statusForLeft =
+        body.status !== undefined || body.stat !== undefined
+          ? body.status || body.stat
+          : '';
+      set('ldate', leftDateForStatus(statusForLeft, body.leftDate || body.ldate));
     }
     if (body.joinDate !== undefined || body.dpj !== undefined) {
       set('dpj', leftDate(body.joinDate || body.dpj) || null);
