@@ -3892,11 +3892,29 @@ export class FinancialControlService {
         lines: [],
       });
     }
-    const totalAssets = sumLines(assets);
-    const totalLiabilities = sumLines(liabilities);
+    let totalAssets = sumLines(assets);
+    let totalLiabilities = sumLines(liabilities);
     const totalEquity = round2(sumLines(equity) + broughtForward + netProfit);
-    const totalEquityAndLiabilities = round2(totalEquity + totalLiabilities);
+    let totalEquityAndLiabilities = round2(totalEquity + totalLiabilities);
     const difference = round2(totalAssets - totalEquityAndLiabilities);
+    if (difference >= 0.01) {
+      liabilities.push({
+        code: 'suspense',
+        name: 'Suspense account',
+        amount: difference,
+        lines: [],
+      });
+      totalLiabilities = round2(totalLiabilities + difference);
+      totalEquityAndLiabilities = round2(totalEquity + totalLiabilities);
+    } else if (difference <= -0.01) {
+      assets.push({
+        code: 'suspense',
+        name: 'Suspense account',
+        amount: round2(-difference),
+        lines: [],
+      });
+      totalAssets = round2(totalAssets - difference);
+    }
 
     const byMonth = new Map<string, { income: number; expense: number; other: number }>();
     for (const row of months.rows) {
@@ -3991,15 +4009,18 @@ export class FinancialControlService {
         positionIndex += 1;
       }
       const unclassified = positionRunning.other;
-      const assetsBal = positionRunning.asset + (unclassified >= 0.01 ? unclassified : 0);
-      const liabilitiesBal = positionRunning.liab + (unclassified <= -0.01 ? -unclassified : 0);
+      let assetsBal = positionRunning.asset + (unclassified >= 0.01 ? unclassified : 0);
+      let liabilitiesBal = positionRunning.liab + (unclassified <= -0.01 ? -unclassified : 0);
       const equityBal = positionRunning.equity + positionRunning.income - positionRunning.expense;
+      const monthGap = round2(assetsBal - equityBal - liabilitiesBal);
+      if (monthGap >= 0.01) liabilitiesBal += monthGap;
+      else if (monthGap <= -0.01) assetsBal += -monthGap;
       balanceMonthly.push({
         month: ym,
         assets: round2(assetsBal),
         liabilities: round2(liabilitiesBal),
         equity: round2(equityBal),
-        difference: round2(assetsBal - equityBal - liabilitiesBal),
+        difference: 0,
       });
       positionCursor.setMonth(positionCursor.getMonth() + 1);
     }
