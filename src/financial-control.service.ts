@@ -4095,7 +4095,7 @@ export class FinancialControlService {
     await this.withClassSection(studentInfo);
     const byClass = new Map<string, FaLine>();
     for (const row of studentInfo) {
-      const amount = round2(row.income - row.expense);
+      const amount = round2(row.income);
       if (Math.abs(amount) < 0.01) continue;
       const key = row.classCode || row.className || 'none';
       const group = byClass.get(key) || {
@@ -4122,7 +4122,6 @@ export class FinancialControlService {
     const studentIncome = round2(studentInfo.reduce((sum, row) => sum + row.income, 0));
     const untagged = studentRows.rows.find((row) => !row.sdno);
     const untaggedIncome = round2(Number(untagged?.income) || 0);
-    const campusExpenses = round2(Number(untagged?.expense) || 0);
     const studentLines: FaLine[] = [];
     if (classLines.length) {
       studentLines.push({
@@ -4140,16 +4139,16 @@ export class FinancialControlService {
         lines: [],
       });
     }
-    if (Math.abs(campusExpenses) >= 0.01) {
+    if (expenses.length) {
       studentLines.push({
-        code: 'campus-expense',
-        name: 'Campus expenses not linked to a student',
-        amount: campusExpenses,
-        lines: [],
+        code: 'student-expense',
+        name: 'Expenses',
+        amount: totalExpenses,
+        lines: expenses,
       });
     }
     const classTotal = round2(classLines.reduce((sum, line) => sum + line.amount, 0));
-    const studentNet = round2(classTotal + untaggedIncome - campusExpenses);
+    const studentNet = round2(classTotal + untaggedIncome - totalExpenses);
 
     return {
       profitAndLoss: { income, expenses, totalIncome, totalExpenses, netProfit, monthly },
@@ -4178,7 +4177,7 @@ export class FinancialControlService {
         lines: studentLines,
         studentIncome,
         untaggedIncome,
-        campusExpenses,
+        campusExpenses: totalExpenses,
         net: studentNet,
       },
       meta: {
