@@ -138,6 +138,8 @@ export class UsersService {
     const fname = (r.fname || '').trim();
     const lname = (r.lname || '').trim();
     const fullName = `${fname} ${lname}`.trim();
+    const roleName = String(r.roleName ?? '').trim();
+    const roleId = String(r.roleId ?? '').trim();
     return {
       id: r.id,
       username: r.username,
@@ -157,9 +159,9 @@ export class UsersService {
       zone: this.zoneLabel(desi),
       campus: r.campusName || this.zoneLabel(desi),
       menuCount,
-      role: this.roleOf(r.username, hasModify),
-      roleId: (r.roleId || '').trim(),
-      roleName: (r.roleName || '').trim(),
+      role: roleName || this.roleOf(r.username, hasModify),
+      roleId,
+      roleName,
       status,
     };
   }
@@ -197,9 +199,21 @@ export class UsersService {
               coalesce(trim(u.gender), '') AS gender,
               coalesce(trim(u.about), '') AS about,
               (
-                SELECT count(*)::text
-                FROM cruser c
-                WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                CASE
+                  WHEN er.id IS NOT NULL THEN (
+                    SELECT count(*)::text
+                    FROM jsonb_each(coalesce(er.rights, '{}'::jsonb)) AS node(k, v)
+                    CROSS JOIN LATERAL jsonb_each(
+                      CASE WHEN jsonb_typeof(node.v) = 'object' THEN node.v ELSE '{}'::jsonb END
+                    ) AS flag(fk, fv)
+                    WHERE flag.fv = 'true'::jsonb
+                  )
+                  ELSE (
+                    SELECT count(*)::text
+                    FROM cruser c
+                    WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                  )
+                END
               ) AS "menuCount",
               (
                 SELECT CASE
@@ -291,7 +305,22 @@ export class UsersService {
           if (!Number.isFinite(n)) break;
           params.push(n);
           where.push(
-            `(SELECT count(*) FROM cruser c WHERE upper(trim(c.crname)) = upper(trim(u.tname))) = $${params.length}`,
+            `(
+               CASE
+                 WHEN er.id IS NOT NULL THEN (
+                   SELECT count(*)
+                   FROM jsonb_each(coalesce(er.rights, '{}'::jsonb)) AS node(k, v)
+                   CROSS JOIN LATERAL jsonb_each(
+                     CASE WHEN jsonb_typeof(node.v) = 'object' THEN node.v ELSE '{}'::jsonb END
+                   ) AS flag(fk, fv)
+                   WHERE flag.fv = 'true'::jsonb
+                 )
+                 ELSE (
+                   SELECT count(*) FROM cruser c
+                   WHERE upper(trim(c.crname)) = upper(trim(u.tname))
+                 )
+               END
+             ) = $${params.length}`,
           );
           break;
         }
@@ -463,11 +492,15 @@ export class UsersService {
       [username],
     );
     if (!roleId) return;
-    const found = await this.database.query(`SELECT id FROM erp_role WHERE id = $1 LIMIT 1`, [roleId]);
-    if (!found.rowCount) return;
+    const found = await this.database.query<{ id: string }>(
+      `SELECT id FROM erp_role WHERE id = $1 LIMIT 1`,
+      [roleId],
+    );
+    if (!found.rows[0]) return;
     await this.database.query(
-      `INSERT INTO erp_user_role (username, role_id) VALUES ($1, $2)`,
-      [username, roleId],
+      `INSERT INTO erp_user_role (username, role_id) VALUES ($1, $2)
+       ON CONFLICT (username) DO UPDATE SET role_id = excluded.role_id`,
+      [username, found.rows[0].id],
     );
   }
 
