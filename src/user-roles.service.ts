@@ -1,34 +1,34 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 
-const FLAGS = ['view', 'edit', 'delete', 'voucher'] as const;
+const FLAGS = ['view', 'add', 'edit', 'delete', 'voucher'] as const;
 type Flag = (typeof FLAGS)[number];
 type Rights = Record<Flag, boolean>;
 
 /** Only the actions that screen actually has. Activity Log is view-only. */
 const NODE_FLAGS: Record<string, readonly Flag[]> = {
   dashboard: ['view'],
-  'registration.students': ['view', 'edit', 'delete'],
-  'registration.employees': ['view', 'edit', 'delete'],
+  'registration.students': ['view', 'add', 'edit', 'delete'],
+  'registration.employees': ['view', 'add', 'edit', 'delete'],
   classChange: ['view', 'edit'],
-  inventoryControl: ['view'],
-  inventoryVoucher: ['view', 'edit', 'delete', 'voucher'],
-  transaction: ['view', 'edit', 'delete', 'voucher'],
+  inventoryControl: ['view', 'add', 'edit', 'delete'],
+  inventoryVoucher: ['view', 'add', 'edit', 'delete', 'voucher'],
+  transaction: ['view', 'add', 'edit', 'delete', 'voucher'],
   financialControl: ['view'],
   finalAccount: ['view'],
   feeControl: ['view'],
-  feeIncrement: ['view', 'edit', 'delete', 'voucher'],
-  payrollReport: ['view'],
-  resultAnalysis: ['view', 'delete'],
+  feeIncrement: ['view', 'add', 'edit', 'delete', 'voucher'],
+  payrollReport: ['view', 'add', 'edit', 'delete'],
+  resultAnalysis: ['view', 'add', 'delete'],
   history: ['view'],
-  campusSetup: ['view', 'edit', 'delete'],
-  users: ['view', 'edit', 'delete'],
-  userRoles: ['view', 'edit', 'delete'],
+  campusSetup: ['view', 'add', 'edit', 'delete'],
+  users: ['view', 'add', 'edit', 'delete'],
+  userRoles: ['view', 'add', 'edit', 'delete'],
   authLogs: ['view'],
 };
 
 function emptyRights(): Rights {
-  return { view: false, edit: false, delete: false, voucher: false };
+  return { view: false, add: false, edit: false, delete: false, voucher: false };
 }
 
 function cleanRights(raw: unknown): Record<string, Rights> {
