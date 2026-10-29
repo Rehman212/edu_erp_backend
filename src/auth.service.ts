@@ -63,6 +63,31 @@ export class AuthService {
       throw new UnauthorizedException('Account is blocked. Contact administrator.');
     }
 
+    await this.database.query(
+      `CREATE TABLE IF NOT EXISTS erp_role (
+         id text PRIMARY KEY,
+         name text NOT NULL,
+         rights jsonb NOT NULL DEFAULT '{}'::jsonb,
+         updated_at timestamptz NOT NULL DEFAULT now()
+       )`,
+    );
+    await this.database.query(
+      `CREATE TABLE IF NOT EXISTS erp_user_role (
+         username text PRIMARY KEY,
+         role_id text NOT NULL
+       )`,
+    );
+    const assigned = await this.database.query<{ name: string; rights: Record<string, { view?: boolean }> }>(
+      `SELECT r.name, r.rights
+       FROM erp_user_role u
+       JOIN erp_role r ON r.id = u.role_id
+       WHERE upper(trim(u.username)) = upper($1)
+       LIMIT 1`,
+      [row.tname],
+    );
+    const assignedRole = assigned.rows[0]?.name?.trim() || '';
+    const roleRights = assigned.rows[0]?.rights ?? null;
+
     const rights = await this.database.query<{ mncode: string }>(
       `SELECT mncode FROM cruser WHERE upper(trim(crname)) = upper($1)`,
       [row.tname],
@@ -104,6 +129,8 @@ export class AuthService {
       role,
       canEdit,
       menus,
+      assignedRole,
+      roleRights,
     };
   }
 

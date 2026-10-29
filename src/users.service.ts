@@ -37,6 +37,20 @@ export class UsersService {
            SET stat = 'Active'
            WHERE coalesce(trim(stat), '') = ''`,
         );
+        await this.database.query(
+          `CREATE TABLE IF NOT EXISTS erp_role (
+             id text PRIMARY KEY,
+             name text NOT NULL,
+             rights jsonb NOT NULL DEFAULT '{}'::jsonb,
+             updated_at timestamptz NOT NULL DEFAULT now()
+           )`,
+        );
+        await this.database.query(
+          `CREATE TABLE IF NOT EXISTS erp_user_role (
+             username text PRIMARY KEY,
+             role_id text NOT NULL
+           )`,
+        );
       })().catch((err) => {
         this.schemaReady = null;
         throw err;
@@ -104,6 +118,8 @@ export class UsersService {
     status: string;
     menuCount: string;
     hasModify: string;
+    roleId?: string | null;
+    roleName?: string | null;
     fname?: string | null;
     lname?: string | null;
     email?: string | null;
@@ -142,6 +158,8 @@ export class UsersService {
       campus: r.campusName || this.zoneLabel(desi),
       menuCount,
       role: this.roleOf(r.username, hasModify),
+      roleId: (r.roleId || '').trim(),
+      roleName: (r.roleName || '').trim(),
       status,
     };
   }
@@ -191,9 +209,13 @@ export class UsersService {
                       AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'
                   ) THEN '1' ELSE '0'
                 END
-              ) AS "hasModify"
+              ) AS "hasModify",
+              coalesce(ur.role_id, '') AS "roleId",
+              coalesce(er.name, '') AS "roleName"
        FROM puser u
-       LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')`;
+       LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')
+       LEFT JOIN erp_user_role ur ON upper(trim(ur.username)) = upper(trim(u.tname))
+       LEFT JOIN erp_role er ON er.id = ur.role_id`;
   }
 
   private zoneCondSql(value: string, params: unknown[]) {
@@ -242,6 +264,7 @@ export class UsersService {
         case 'role':
           if (v.toLowerCase() === 'admin') where.push(isAdmin);
           else if (v.toLowerCase() === 'user') where.push(`NOT ${isAdmin}`);
+          else where.push(like(`coalesce(er.name, '')`, v));
           break;
         case 'status':
           if (v.toLowerCase() === 'blocked') where.push(isBlocked);
@@ -355,6 +378,8 @@ export class UsersService {
       `SELECT count(*)::text AS total
        FROM puser u
        LEFT JOIN acc a ON trim(a.acode) = coalesce(trim(u.desi), '')
+       LEFT JOIN erp_user_role ur ON upper(trim(ur.username)) = upper(trim(u.tname))
+       LEFT JOIN erp_role er ON er.id = ur.role_id
        WHERE ${where.join(' AND ')}`,
       params,
     );
@@ -430,6 +455,22 @@ export class UsersService {
     };
   }
 
+  private async saveUserRole(username: string, roleIdRaw: string | undefined) {
+    if (roleIdRaw === undefined) return;
+    const roleId = String(roleIdRaw).trim();
+    await this.database.query(
+      `DELETE FROM erp_user_role WHERE upper(trim(username)) = upper($1)`,
+      [username],
+    );
+    if (!roleId) return;
+    const found = await this.database.query(`SELECT id FROM erp_role WHERE id = $1 LIMIT 1`, [roleId]);
+    if (!found.rowCount) return;
+    await this.database.query(
+      `INSERT INTO erp_user_role (username, role_id) VALUES ($1, $2)`,
+      [username, roleId],
+    );
+  }
+
   async create(actor: string, body: Record<string, string | undefined>) {
     await this.ensureSchema();
     const username = String(body.username || body.tname || '').trim();
@@ -475,6 +516,7 @@ export class UsersService {
         profile.about,
       ],
     );
+    await this.saveUserRole(username, body.roleId);
 
     const created = await this.database.query<{
       id: string;
@@ -585,7 +627,12 @@ export class UsersService {
         `UPDATE cruser SET crname = $1 WHERE upper(trim(crname)) = upper($2)`,
         [nextName, row.tname],
       );
+      await this.database.query(
+        `UPDATE erp_user_role SET username = $1 WHERE upper(trim(username)) = upper($2)`,
+        [nextName, row.tname],
+      );
     }
+    await this.saveUserRole(nextName, body.roleId);
 
     const updated = await this.database.query<{
       id: string;

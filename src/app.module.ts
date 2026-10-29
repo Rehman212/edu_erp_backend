@@ -21,6 +21,8 @@ import { CampusSetupController } from './campus-setup.controller';
 import { CampusSetupService } from './campus-setup.service';
 import { UsersController } from './users.controller';
 import { UsersService } from './users.service';
+import { UserRolesController } from './user-roles.controller';
+import { UserRolesService } from './user-roles.service';
 import { SettingsController } from './settings.controller';
 import { SettingsService } from './settings.service';
 import { FeeIncrementController } from './fee-increment.controller';
@@ -40,6 +42,7 @@ import { DashboardService } from './dashboard.service';
     RegistrationController,
     CampusSetupController,
     UsersController,
+    UserRolesController,
     ActivityLogController,
     SettingsController,
     FeeIncrementController,
@@ -57,6 +60,7 @@ import { DashboardService } from './dashboard.service';
     RegistrationService,
     CampusSetupService,
     UsersService,
+    UserRolesService,
     SettingsService,
     FeeIncrementService,
     DashboardService,
