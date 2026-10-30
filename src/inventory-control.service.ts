@@ -2018,9 +2018,15 @@ export class InventoryControlService {
       unit?: string;
       moveDate?: string;
       moveType?: string;
+      mode?: string;
     },
   ) {
-    await assertRoleAccess(this.database, username, 'inventoryControl', 'add');
+    await assertRoleAccess(
+      this.database,
+      username,
+      'inventoryControl',
+      body.mode === 'edit' ? 'edit' : 'add',
+    );
     const scope = await this.siteScope(username, body.site ?? '');
     if (!scope) {
       return { ok: false, message: 'Campus / site is required or not allowed for this user.' };

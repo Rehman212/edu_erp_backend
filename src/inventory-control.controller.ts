@@ -208,6 +208,7 @@ export class InventoryControlController {
       unit?: string;
       moveDate?: string;
       moveType?: string;
+      mode?: string;
     },
   ) {
     return this.inventory.addStock(user ?? '', body ?? {});

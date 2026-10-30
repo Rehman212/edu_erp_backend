@@ -683,16 +683,22 @@ export class UsersService {
     if (category !== undefined) push('cata', category);
     if (status !== undefined) push('stat', status);
     if (accountType !== undefined) push('acct', accountType);
-    push('fname', profile.fname);
-    push('lname', profile.lname);
-    push('email', profile.email);
-    push('mobile1', profile.mobile1);
-    push('mobile2', profile.mobile2);
-    push('landline', profile.landline);
-    push('address', profile.address);
-    push('city', profile.city);
-    push('gender', profile.gender);
-    push('about', profile.about);
+    const profileKeys = [
+      'fname', 'firstName', 'lname', 'lastName', 'email', 'mobile1',
+      'mobile2', 'landline', 'address', 'city', 'gender', 'about',
+    ];
+    if (profileKeys.some((key) => body[key] !== undefined)) {
+      push('fname', profile.fname);
+      push('lname', profile.lname);
+      push('email', profile.email);
+      push('mobile1', profile.mobile1);
+      push('mobile2', profile.mobile2);
+      push('landline', profile.landline);
+      push('address', profile.address);
+      push('city', profile.city);
+      push('gender', profile.gender);
+      push('about', profile.about);
+    }
 
     params.push(id);
     await this.database.query(
