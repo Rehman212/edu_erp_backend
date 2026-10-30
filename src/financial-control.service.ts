@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 import { ActivityLogService } from './activity-log.service';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 export type TbNode = {
   code: string;
@@ -3388,6 +3389,7 @@ export class FinancialControlService {
   }
 
   async deleteAccountsVoucher(username: string, invnoRaw: string) {
+    await assertRoleAccess(this.database, username, 'transaction', 'delete');
     const invno = String(invnoRaw || '').trim();
     if (!invno) return { ok: false, message: 'Invoice required' };
     if (!this.accountsSuffixOk(invno)) {
@@ -3482,6 +3484,7 @@ export class FinancialControlService {
       invno,
     ]);
     const isUpdate = Boolean(exists.rowCount);
+    await assertRoleAccess(this.database, username, 'transaction', isUpdate ? 'edit' : 'add');
     const invdateStore = `${invdate} 00:00:00`;
     const uname = username.trim() || '';
 

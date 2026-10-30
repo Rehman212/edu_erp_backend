@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 const ZONE_LABEL: Record<string, string> = {
   '1401': 'Shah Rukn-e-Alam (SRA)',
@@ -505,6 +506,7 @@ export class UsersService {
   }
 
   async create(actor: string, body: Record<string, string | undefined>) {
+    await assertRoleAccess(this.database, actor, 'users', 'add');
     await this.ensureSchema();
     const username = String(body.username || body.tname || '').trim();
     const password = String(body.password || body.passwd || '').trim();
@@ -576,6 +578,7 @@ export class UsersService {
   }
 
   async update(actor: string, idRaw: string, body: Record<string, string | undefined>) {
+    await assertRoleAccess(this.database, actor, 'users', 'edit');
     await this.ensureSchema();
     const id = String(idRaw || '').trim();
     if (!id) return { ok: false, message: 'User id required.' };
@@ -803,6 +806,7 @@ export class UsersService {
   }
 
   async remove(actor: string, idRaw: string) {
+    await assertRoleAccess(this.database, actor, 'users', 'delete');
     await this.ensureSchema();
     const id = String(idRaw || '').trim();
     if (!id) return { ok: false, message: 'User id required.' };

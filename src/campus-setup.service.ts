@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 const ZONE_ROOTS = ['1401', '1402', '1403'] as const;
 const CAMPUS_LIKE = '14__01____';
@@ -358,6 +359,7 @@ export class CampusSetupService {
     username: string,
     body: Record<string, string | undefined>,
   ) {
+    await assertRoleAccess(this.database, username, 'campusSetup', 'add');
     const name = cleanName(body.name);
     const address = cleanText(body.address);
     const phone = cleanText(body.phone);
@@ -405,6 +407,7 @@ export class CampusSetupService {
     codeRaw: string,
     body: Record<string, string | undefined>,
   ) {
+    await assertRoleAccess(this.database, username, 'campusSetup', 'edit');
     const code = cleanText(codeRaw);
     if (!this.isCampusCode(code)) {
       return { ok: false, message: 'Invalid campus code.' };
@@ -450,6 +453,7 @@ export class CampusSetupService {
   }
 
   async deleteCampus(username: string, codeRaw: string) {
+    await assertRoleAccess(this.database, username, 'campusSetup', 'delete');
     const code = cleanText(codeRaw);
     if (!this.isCampusCode(code)) {
       return { ok: false, message: 'Invalid campus code.' };
@@ -510,7 +514,7 @@ export class CampusSetupService {
     username: string,
     body: Record<string, string | undefined>,
   ) {
-    void username;
+    await assertRoleAccess(this.database, username, 'campusSetup', 'add');
     const name = cleanName(body.name);
     if (!name) return { ok: false, message: 'Section name is required.' };
 
@@ -545,7 +549,7 @@ export class CampusSetupService {
     codeRaw: string,
     body: Record<string, string | undefined>,
   ) {
-    void username;
+    await assertRoleAccess(this.database, username, 'campusSetup', 'edit');
     const code = cleanText(codeRaw);
     if (!this.isSectionCode(code)) {
       return { ok: false, message: 'Invalid section code.' };
@@ -581,7 +585,7 @@ export class CampusSetupService {
   }
 
   async deleteSection(username: string, codeRaw: string) {
-    void username;
+    await assertRoleAccess(this.database, username, 'campusSetup', 'delete');
     const code = cleanText(codeRaw);
     if (!this.isSectionCode(code)) {
       return { ok: false, message: 'Invalid section code.' };

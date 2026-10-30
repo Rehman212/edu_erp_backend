@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 function round2(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
@@ -1686,6 +1687,12 @@ export class PayrollService {
       photo?: string;
     },
   ) {
+    await assertRoleAccess(
+      this.database,
+      username,
+      ['registration.employees', 'payrollReport'],
+      'add',
+    );
     if (!(await this.tableExists('persona'))) {
       return { ok: false, message: 'Employee table (persona) not found.' };
     }
@@ -1777,6 +1784,12 @@ export class PayrollService {
       photo?: string;
     },
   ) {
+    await assertRoleAccess(
+      this.database,
+      username,
+      ['registration.employees', 'payrollReport'],
+      'edit',
+    );
     if (!(await this.tableExists('persona'))) {
       return { ok: false, message: 'Employee table (persona) not found.' };
     }
@@ -1837,15 +1850,29 @@ export class PayrollService {
   }
 
   async deleteEmployee(username: string, codeRaw: string) {
+    await assertRoleAccess(
+      this.database,
+      username,
+      ['registration.employees', 'payrollReport'],
+      'delete',
+    );
     // Soft-deactivate instead of hard delete (payroll Active/Inactive).
-    return this.setEmployeeActive(username, codeRaw, false);
+    return this.setEmployeeActive(username, codeRaw, false, true);
   }
 
   /**
    * Toggle employment flag on persona.sta (A = Active, I = Inactive).
    * Salary generate only posts employees with sta = A.
    */
-  async setEmployeeActive(username: string, codeRaw: string, active: boolean) {
+  async setEmployeeActive(username: string, codeRaw: string, active: boolean, alreadyChecked = false) {
+    if (!alreadyChecked) {
+      await assertRoleAccess(
+        this.database,
+        username,
+        ['registration.employees', 'payrollReport'],
+        'edit',
+      );
+    }
     if (!(await this.tableExists('persona'))) {
       return { ok: false, message: 'Employee table (persona) not found.' };
     }

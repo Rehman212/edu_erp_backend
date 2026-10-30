@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ActivityLogService } from './activity-log.service';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 export type StockReportMode =
   | 'full'
@@ -1708,6 +1709,7 @@ export class InventoryControlService {
       }>;
     },
   ) {
+    await assertRoleAccess(this.database, username, 'inventoryVoucher', 'add');
     const kind = String(body.kind ?? '').trim();
     if (kind === 'studentVoucher' || kind === 'collectionVoucher') {
       return this.saveFeeVoucher(username, kind, body);
@@ -1915,6 +1917,7 @@ export class InventoryControlService {
 
   /** Delete inventory voucher header (+ any detail lines). */
   async deleteVoucher(username: string, invnoRaw: string) {
+    await assertRoleAccess(this.database, username, 'inventoryVoucher', 'delete');
     const invno = String(invnoRaw ?? '').trim();
     if (!invno) {
       return { ok: false, message: 'Invoice no is required.' };
@@ -2017,6 +2020,7 @@ export class InventoryControlService {
       moveType?: string;
     },
   ) {
+    await assertRoleAccess(this.database, username, 'inventoryControl', 'add');
     const scope = await this.siteScope(username, body.site ?? '');
     if (!scope) {
       return { ok: false, message: 'Campus / site is required or not allowed for this user.' };
@@ -2137,6 +2141,7 @@ export class InventoryControlService {
     username: string,
     body: { site?: string; itemCode?: string },
   ) {
+    await assertRoleAccess(this.database, username, 'inventoryControl', 'delete');
     const itemCode = String(body.itemCode ?? '').trim();
     const site = String(body.site ?? '').trim();
     if (!itemCode) {

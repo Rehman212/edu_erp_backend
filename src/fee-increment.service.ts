@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { QueryResult, QueryResultRow } from 'pg';
 import { ActivityLogService } from './activity-log.service';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 export type FeeAction = 'increment' | 'generate' | 'discount' | 'delete';
 export type FeeHead = 'tuition' | 'van' | 'annual' | 'summer' | 'fine' | 'freeze';
@@ -310,6 +311,12 @@ export class FeeIncrementService {
   async apply(username: string, body: FeeBulkBody) {
     const p = this.parse(body);
     if ('error' in p) return { ok: false, message: p.error, done: 0 };
+    await assertRoleAccess(
+      this.database,
+      username,
+      'feeIncrement',
+      p.action === 'delete' ? 'delete' : p.action === 'generate' ? 'add' : 'edit',
+    );
     const zone = await this.zonePrefix(username);
     if (zone && !p.site.startsWith(zone)) return { ok: false, message: 'This campus is outside your zone.', done: 0 };
     const pickedInvnos = new Set(

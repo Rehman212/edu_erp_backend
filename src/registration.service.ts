@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 function moneyNum(v: unknown): number {
   const n = Number(String(v ?? '').replace(/,/g, '').trim());
@@ -162,6 +163,7 @@ export class RegistrationService implements OnModuleInit {
       sdnos?: unknown;
     },
   ) {
+    await assertRoleAccess(this.database, username, 'classChange', 'edit');
     const site = String(body.site || '').trim();
     const fromClass = String(body.fromClass || '').trim();
     const fromSection = String(body.fromSection || '').trim();
@@ -835,6 +837,7 @@ export class RegistrationService implements OnModuleInit {
     username: string,
     body: Record<string, string | number | undefined>,
   ) {
+    await assertRoleAccess(this.database, username, 'registration.students', 'add');
     let sdno = String(body.sdno || body.code || '').trim();
     const name = String(body.name || '').trim();
     const siteCode = String(body.siteCode || body.ccode || '').trim();
@@ -929,6 +932,7 @@ export class RegistrationService implements OnModuleInit {
     sdnoRaw: string,
     body: Record<string, string | number | undefined>,
   ) {
+    await assertRoleAccess(this.database, username, 'registration.students', 'edit');
     const sdno = String(sdnoRaw || '').trim();
     if (!sdno) return { ok: false, message: 'Student code required.' };
 
@@ -1083,6 +1087,7 @@ export class RegistrationService implements OnModuleInit {
   }
 
   async deleteStudent(username: string, sdnoRaw: string) {
+    await assertRoleAccess(this.database, username, 'registration.students', 'delete');
     const sdno = String(sdnoRaw || '').trim();
     if (!sdno) return { ok: false, message: 'Student code required.' };
     const result = await this.database.query(

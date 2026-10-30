@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Put } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Put } from '@nestjs/common';
 import { UserRolesService } from './user-roles.service';
 
 @Controller('user-roles')
@@ -11,17 +11,24 @@ export class UserRolesController {
   }
 
   @Post()
-  create(@Body() body: { name?: string; rights?: unknown }) {
-    return this.roles.create(body || {});
+  create(
+    @Headers('x-ess-user') user: string | undefined,
+    @Body() body: { name?: string; rights?: unknown },
+  ) {
+    return this.roles.create(user ?? '', body || {});
   }
 
   @Put(':id')
-  update(@Param('id') id: string, @Body() body: { name?: string; rights?: unknown }) {
-    return this.roles.update(id, body || {});
+  update(
+    @Headers('x-ess-user') user: string | undefined,
+    @Param('id') id: string,
+    @Body() body: { name?: string; rights?: unknown },
+  ) {
+    return this.roles.update(user ?? '', id, body || {});
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.roles.remove(id);
+  remove(@Headers('x-ess-user') user: string | undefined, @Param('id') id: string) {
+    return this.roles.remove(user ?? '', id);
   }
 }

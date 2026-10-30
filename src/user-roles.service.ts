@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from './database.service';
+import { assertRoleAccess } from './role-access';
 
 const FLAGS = ['view', 'add', 'edit', 'delete', 'voucher'] as const;
 type Flag = (typeof FLAGS)[number];
@@ -93,7 +94,8 @@ export class UserRolesService {
     };
   }
 
-  async create(body: { name?: string; rights?: unknown }) {
+  async create(username: string, body: { name?: string; rights?: unknown }) {
+    await assertRoleAccess(this.database, username, 'userRoles', 'add');
     await this.ensureSchema();
     const name = String(body.name ?? '').trim().slice(0, 80);
     if (!name) throw new BadRequestException('Role name is required');
@@ -122,7 +124,8 @@ export class UserRolesService {
     };
   }
 
-  async update(id: string, body: { name?: string; rights?: unknown }) {
+  async update(username: string, id: string, body: { name?: string; rights?: unknown }) {
+    await assertRoleAccess(this.database, username, 'userRoles', 'edit');
     await this.ensureSchema();
     const name = String(body.name ?? '').trim().slice(0, 80);
     if (!name) throw new BadRequestException('Role name is required');
@@ -152,7 +155,8 @@ export class UserRolesService {
     };
   }
 
-  async remove(id: string) {
+  async remove(username: string, id: string) {
+    await assertRoleAccess(this.database, username, 'userRoles', 'delete');
     await this.ensureSchema();
     const result = await this.database.query(`DELETE FROM erp_role WHERE id = $1`, [id]);
     if (!result.rowCount) throw new NotFoundException('Role not found');
