@@ -8,6 +8,7 @@ type UserRow = {
   desi: string | null;
   passwd: string | null;
   stat: string | null;
+  acct: string | null;
 };
 
 @Injectable()
@@ -27,10 +28,30 @@ export class AuthService {
     await this.database.query(
       `ALTER TABLE puser ADD COLUMN IF NOT EXISTS stat text`,
     );
+    await this.database.query(
+      `ALTER TABLE puser ADD COLUMN IF NOT EXISTS acct text`,
+    );
+    await this.database.query(`ALTER TABLE puser ADD COLUMN IF NOT EXISTS fname text`);
+    await this.database.query(`ALTER TABLE puser ADD COLUMN IF NOT EXISTS lname text`);
+    await this.database.query(
+      `UPDATE puser
+       SET acct = 'Admin'
+       WHERE coalesce(trim(acct), '') = ''
+         AND (
+           upper(trim(tname)) IN ('ESS_ADMN', 'ESS')
+           OR upper(trim(tname)) LIKE '%HAMZA%'
+           OR upper(coalesce(fname, '')) LIKE '%HAMZA%'
+           OR upper(coalesce(lname, '')) LIKE '%HAMZA%'
+         )`,
+    );
+    await this.database.query(
+      `UPDATE puser SET acct = 'User' WHERE coalesce(trim(acct), '') = ''`,
+    );
 
     const user = await this.database.query<UserRow>(
       `SELECT tname, cata, desi, passwd,
-              coalesce(nullif(trim(stat), ''), 'Active') AS stat
+              coalesce(nullif(trim(stat), ''), 'Active') AS stat,
+              coalesce(nullif(trim(acct), ''), 'User') AS acct
        FROM puser
        WHERE upper(trim(tname)) = upper($1)
        LIMIT 1`,
@@ -101,11 +122,8 @@ export class AuthService {
     ];
     const loginName = row.tname.trim();
     const desi = row.desi?.trim() ?? '';
-    const canEdit =
-      loginName === 'ESS_ADMN' ||
-      loginName === 'ESS' ||
-      menus.some((code) => code.toUpperCase().includes('MODIFY'));
-    const role = canEdit ? 'Admin' : 'User';
+    const role = String(row.acct || '').trim().toLowerCase() === 'admin' ? 'Admin' : 'User';
+    const canEdit = role === 'Admin';
     const zone = zoneName(desi);
 
     await this.activityLog.write({

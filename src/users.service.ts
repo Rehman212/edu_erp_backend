@@ -39,6 +39,25 @@ export class UsersService {
            WHERE coalesce(trim(stat), '') = ''`,
         );
         await this.database.query(
+          `ALTER TABLE puser ADD COLUMN IF NOT EXISTS acct text`,
+        );
+        await this.database.query(
+          `UPDATE puser
+           SET acct = 'Admin'
+           WHERE coalesce(trim(acct), '') = ''
+             AND (
+               upper(trim(tname)) IN ('ESS_ADMN', 'ESS')
+               OR upper(trim(tname)) LIKE '%HAMZA%'
+               OR upper(coalesce(fname, '')) LIKE '%HAMZA%'
+               OR upper(coalesce(lname, '')) LIKE '%HAMZA%'
+             )`,
+        );
+        await this.database.query(
+          `UPDATE puser
+           SET acct = 'User'
+           WHERE coalesce(trim(acct), '') = ''`,
+        );
+        await this.database.query(
           `CREATE TABLE IF NOT EXISTS erp_role (
              id text PRIMARY KEY,
              name text NOT NULL,
@@ -96,9 +115,12 @@ export class UsersService {
     return d;
   }
 
-  private roleOf(username: string, hasModify: boolean) {
+  private accountOf(username: string, acct: string) {
+    const picked = String(acct || '').trim().toLowerCase();
+    if (picked === 'admin') return 'Admin';
+    if (picked === 'user') return 'User';
     const u = username.trim().toUpperCase();
-    if (u === 'ESS_ADMN' || u === 'ESS' || hasModify) return 'Admin';
+    if (u === 'ESS_ADMN' || u === 'ESS') return 'Admin';
     return 'User';
   }
 
@@ -119,6 +141,7 @@ export class UsersService {
     status: string;
     menuCount: string;
     hasModify: string;
+    acct?: string | null;
     roleId?: string | null;
     roleName?: string | null;
     fname?: string | null;
@@ -133,8 +156,8 @@ export class UsersService {
     about?: string | null;
   }) {
     const menuCount = Number(r.menuCount) || 0;
-    const hasModify = r.hasModify === '1';
     const desi = r.desi || '';
+    const accountType = this.accountOf(r.username, r.acct || '');
     const status = this.normalizeStatus(r.status);
     const fname = (r.fname || '').trim();
     const lname = (r.lname || '').trim();
@@ -160,7 +183,8 @@ export class UsersService {
       zone: this.zoneLabel(desi),
       campus: r.campusName || this.zoneLabel(desi),
       menuCount,
-      role: roleName || this.roleOf(r.username, hasModify),
+      role: roleName || accountType,
+      accountType,
       roleId,
       roleName,
       status,
@@ -225,6 +249,7 @@ export class UsersService {
                   ) THEN '1' ELSE '0'
                 END
               ) AS "hasModify",
+              coalesce(nullif(trim(u.acct), ''), '') AS acct,
               coalesce(ur.role_id, '') AS "roleId",
               coalesce(er.name, '') AS "roleName"
        FROM puser u
@@ -250,10 +275,7 @@ export class UsersService {
       params.push(`%${v.trim()}%`);
       return `${expr} ILIKE $${params.length}`;
     };
-    const isAdmin = `(upper(trim(u.tname)) IN ('ESS_ADMN', 'ESS') OR EXISTS (
-        SELECT 1 FROM cruser c
-        WHERE upper(trim(c.crname)) = upper(trim(u.tname))
-          AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'))`;
+    const isAdmin = `upper(coalesce(trim(u.acct), '')) = 'ADMIN'`;
     const isBlocked = `lower(coalesce(trim(u.stat), '')) IN ('blocked', 'block', 'inactive')`;
 
     for (const [key, raw] of Object.entries(colFilters)) {
@@ -445,12 +467,7 @@ export class UsersService {
     }>(
       `SELECT count(*)::text AS total,
               count(*) FILTER (
-                WHERE upper(trim(u.tname)) IN ('ESS_ADMN', 'ESS')
-                   OR EXISTS (
-                     SELECT 1 FROM cruser c
-                     WHERE upper(trim(c.crname)) = upper(trim(u.tname))
-                       AND upper(coalesce(c.mncode, '')) LIKE '%MODIFY%'
-                   )
+                WHERE upper(coalesce(trim(u.acct), '')) = 'ADMIN'
               )::text AS admins,
               count(*) FILTER (
                 WHERE EXISTS (
@@ -513,6 +530,7 @@ export class UsersService {
     const desi = String(body.desi || body.scope || '14').trim() || '14';
     const category = String(body.category || body.cata || '1').trim() || '1';
     const status = this.normalizeStatus(body.status);
+    const accountType = this.accountOf(username, body.accountType || body.acct || '');
     const profile = this.profileFromBody(body);
 
     if (!username) return { ok: false, message: 'Username is required.' };
@@ -529,16 +547,17 @@ export class UsersService {
 
     await this.database.query(
       `INSERT INTO puser (
-         tname, passwd, cata, desi, stat,
+         tname, passwd, cata, desi, stat, acct,
          fname, lname, email, mobile1, mobile2, landline,
          address, city, gender, about
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
       [
         username,
         password,
         category,
         desi,
         status,
+        accountType,
         profile.fname,
         profile.lname,
         profile.email,
@@ -620,6 +639,10 @@ export class UsersService {
         : undefined;
     const status =
       body.status !== undefined ? this.normalizeStatus(body.status) : undefined;
+    const accountType =
+      body.accountType !== undefined || body.acct !== undefined
+        ? this.accountOf(nextName, body.accountType || body.acct || '')
+        : undefined;
     const profile = this.profileFromBody(body);
 
     if (
@@ -641,6 +664,7 @@ export class UsersService {
     if (desi !== undefined) push('desi', desi);
     if (category !== undefined) push('cata', category);
     if (status !== undefined) push('stat', status);
+    if (accountType !== undefined) push('acct', accountType);
     push('fname', profile.fname);
     push('lname', profile.lname);
     push('email', profile.email);
