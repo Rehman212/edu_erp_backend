@@ -2149,6 +2149,7 @@ export class PayrollService {
       rows?: { code?: string; absent?: unknown; leave?: unknown; security?: unknown; transport?: unknown }[];
     },
   ) {
+    await assertRoleAccess(this.database, username, 'payrollReport', 'voucher');
     const info = this.monthInfo(String(body.mont || ''));
     if (!info) return { ok: false, message: 'Select a valid month.' };
     const input = (Array.isArray(body.rows) ? body.rows : [])

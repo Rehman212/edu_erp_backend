@@ -1929,6 +1929,7 @@ export class FinancialControlService {
       }>;
     },
   ) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'edit');
     const invno = String(body.invno || '').trim();
     if (!invno) return { ok: false, message: 'Invoice required', master: null, lines: [] };
     if (!invno.toUpperCase().endsWith('F')) {
@@ -2058,6 +2059,7 @@ export class FinancialControlService {
   }
 
   async deleteVoucher(username: string, invnoRaw: string) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'delete');
     const invno = String(invnoRaw || '').trim();
     if (!invno) return { ok: false, message: 'Invoice required' };
     if (!invno.toUpperCase().endsWith('F')) {
@@ -2439,6 +2441,7 @@ export class FinancialControlService {
 
   /** Reverse several payments; newest first so split balances fold back in order. */
   async reversePayments(username: string, invnosRaw: unknown) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'edit');
     const invnos = [
       ...new Set(
         (Array.isArray(invnosRaw) ? invnosRaw : [])
@@ -2469,6 +2472,7 @@ export class FinancialControlService {
    * Permanently removes unpaid fee bills (…G). Paid bills must be marked unpaid first.
    */
   async deleteChallans(username: string, invnosRaw: unknown) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'delete');
     const invnos = [
       ...new Set(
         (Array.isArray(invnosRaw) ? invnosRaw : [])
@@ -2647,6 +2651,7 @@ export class FinancialControlService {
       lines?: Array<{ invno?: string; received?: number | string }>;
     },
   ) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'voucher');
     const payDate = this.normDate(String(body.payDate || '')) || this.today();
     const bankCode = String(body.bankCode || '').trim();
     if (!bankCode.startsWith('1506')) {
@@ -2837,6 +2842,7 @@ export class FinancialControlService {
    * unpaid "(Balance)" challan it created back into the original …G.
    */
   async reversePayment(username: string, invnoRaw: string) {
+    await assertRoleAccess(this.database, username, 'feeControl', 'edit');
     const raw = String(invnoRaw || '').trim().toUpperCase();
     if (!/^\d+[GF]?$/.test(raw)) return { ok: false, message: 'Enter a valid challan or receipt number.' };
     const num = raw.replace(/[GF]$/, '');
@@ -2970,6 +2976,12 @@ export class FinancialControlService {
     headsRaw: unknown = [],
     fineRaw: unknown = 0,
   ) {
+    await assertRoleAccess(
+      this.database,
+      username,
+      ['registration.students', 'feeControl'],
+      'voucher',
+    );
     const sdno = String(sdnoRaw || '').trim().toUpperCase();
     if (!sdno) return { ok: false, message: 'Student ID required.', created: [] };
     const rawKey = toYyyymm(montRaw);

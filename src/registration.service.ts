@@ -1087,7 +1087,12 @@ export class RegistrationService implements OnModuleInit {
   }
 
   async deleteStudent(username: string, sdnoRaw: string) {
-    await assertRoleAccess(this.database, username, 'registration.students', 'delete');
+    await assertRoleAccess(
+      this.database,
+      username,
+      ['registration.students', 'resultAnalysis'],
+      'delete',
+    );
     const sdno = String(sdnoRaw || '').trim();
     if (!sdno) return { ok: false, message: 'Student code required.' };
     const result = await this.database.query(

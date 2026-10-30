@@ -9,7 +9,7 @@ type Rights = Record<Flag, boolean>;
 /** Only the actions that screen actually has. Activity Log is view-only. */
 const NODE_FLAGS: Record<string, readonly Flag[]> = {
   dashboard: ['view'],
-  'registration.students': ['view', 'add', 'edit', 'delete'],
+  'registration.students': ['view', 'add', 'edit', 'delete', 'voucher'],
   'registration.employees': ['view', 'add', 'edit', 'delete'],
   classChange: ['view', 'edit'],
   inventoryControl: ['view', 'add', 'edit', 'delete'],
@@ -17,10 +17,10 @@ const NODE_FLAGS: Record<string, readonly Flag[]> = {
   transaction: ['view', 'add', 'edit', 'delete', 'voucher'],
   financialControl: ['view'],
   finalAccount: ['view'],
-  feeControl: ['view'],
+  feeControl: ['view', 'edit', 'delete', 'voucher'],
   feeIncrement: ['view', 'add', 'edit', 'delete', 'voucher'],
-  payrollReport: ['view', 'add', 'edit', 'delete'],
-  resultAnalysis: ['view', 'add', 'delete'],
+  payrollReport: ['view', 'add', 'edit', 'delete', 'voucher'],
+  resultAnalysis: ['view', 'add', 'edit', 'delete'],
   history: ['view'],
   campusSetup: ['view', 'add', 'edit', 'delete'],
   users: ['view', 'add', 'edit', 'delete'],
