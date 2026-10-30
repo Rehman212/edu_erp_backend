@@ -40,8 +40,11 @@ export class AuthService {
          AND (
            upper(trim(tname)) IN ('ESS_ADMN', 'ESS')
            OR upper(trim(tname)) LIKE '%HAMZA%'
+           OR upper(trim(tname)) LIKE '%HUMZA%'
            OR upper(coalesce(fname, '')) LIKE '%HAMZA%'
+           OR upper(coalesce(fname, '')) LIKE '%HUMZA%'
            OR upper(coalesce(lname, '')) LIKE '%HAMZA%'
+           OR upper(coalesce(lname, '')) LIKE '%HUMZA%'
          )`,
     );
     await this.database.query(
