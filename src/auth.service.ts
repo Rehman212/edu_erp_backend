@@ -88,6 +88,45 @@ export class AuthService {
       throw new UnauthorizedException('Account is blocked. Contact administrator.');
     }
 
+    const profile = await this.sessionProfile(row);
+
+    await this.activityLog.write({
+      category: 'auth',
+      username: profile.username,
+      role: profile.role,
+      activity: 'Login',
+      description: `Signed in to The Educators ERP (${profile.zone})`,
+      module: 'Auth',
+      campus: profile.zone,
+      campusCode: profile.desi,
+      status: 'Success',
+      ipAddress,
+    });
+
+    const token = await issueToken(this.database, profile.username);
+
+    return { token, ...profile };
+  }
+
+  /** Current rights for a signed-in user, so role changes apply without signing in again. */
+  async me(username: string) {
+    const name = username.trim();
+    if (!name) throw new UnauthorizedException('Session expired. Please sign in again.');
+    const user = await this.database.query<UserRow>(
+      `SELECT tname, cata, desi, passwd,
+              coalesce(nullif(trim(stat), ''), 'Active') AS stat,
+              coalesce(nullif(trim(acct), ''), 'User') AS acct
+       FROM puser
+       WHERE upper(trim(tname)) = upper($1)
+       LIMIT 1`,
+      [name],
+    );
+    const row = user.rows[0];
+    if (!row) throw new UnauthorizedException('Session expired. Please sign in again.');
+    return this.sessionProfile(row);
+  }
+
+  private async sessionProfile(row: UserRow) {
     await this.database.query(
       `CREATE TABLE IF NOT EXISTS erp_role (
          id text PRIMARY KEY,
@@ -124,35 +163,17 @@ export class AuthService {
           .filter((code): code is string => Boolean(code)),
       ),
     ];
-    const loginName = row.tname.trim();
     const desi = row.desi?.trim() ?? '';
-    const role = String(row.acct || '').trim().toLowerCase() === 'admin' ? 'Admin' : 'User';
-    const canEdit = role === 'Admin';
-    const zone = zoneName(desi);
-
-    await this.activityLog.write({
-      category: 'auth',
-      username: loginName,
-      role,
-      activity: 'Login',
-      description: `Signed in to The Educators ERP (${zone})`,
-      module: 'Auth',
-      campus: zone,
-      campusCode: desi,
-      status: 'Success',
-      ipAddress,
-    });
-
-    const token = await issueToken(this.database, loginName);
+    const role: 'Admin' | 'User' =
+      String(row.acct || '').trim().toLowerCase() === 'admin' ? 'Admin' : 'User';
 
     return {
-      token,
-      username: loginName,
+      username: row.tname.trim(),
       cata: row.cata?.trim() ?? null,
       desi,
-      zone,
+      zone: zoneName(desi),
       role,
-      canEdit,
+      canEdit: role === 'Admin',
       menus,
       assignedRole,
       roleRights,

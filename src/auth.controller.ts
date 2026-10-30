@@ -1,4 +1,4 @@
-import { Body, Controller, Headers, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Post, Req } from '@nestjs/common';
 import type { Request } from 'express';
 import { bearerToken } from './auth-token';
 import { AuthService } from './auth.service';
@@ -21,6 +21,11 @@ export class AuthController {
     @Req() req: Request,
   ) {
     return this.auth.login(body.username ?? '', body.password ?? '', clientIp(req));
+  }
+
+  @Get('me')
+  me(@Headers('x-ess-user') user: string | undefined) {
+    return this.auth.me(user ?? '');
   }
 
   @Post('logout')
