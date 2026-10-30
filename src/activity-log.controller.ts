@@ -42,7 +42,7 @@ export class ActivityLogController {
   ) {
     return this.logs.write({
       category: 'activity',
-      username: user || body.username || '',
+      username: user || '',
       role: body.role || '',
       activity: body.activity || 'Event',
       description: body.description || '',

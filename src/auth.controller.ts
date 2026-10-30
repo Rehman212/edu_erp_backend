@@ -1,5 +1,6 @@
 import { Body, Controller, Headers, Post, Req } from '@nestjs/common';
 import type { Request } from 'express';
+import { bearerToken } from './auth-token';
 import { AuthService } from './auth.service';
 
 function clientIp(req: Request) {
@@ -25,11 +26,13 @@ export class AuthController {
   @Post('logout')
   logout(
     @Headers('x-ess-user') user: string | undefined,
-    @Body() body: { username?: string; role?: string; campus?: string; campusCode?: string },
+    @Headers('authorization') authorization: string | undefined,
+    @Body() body: { role?: string; campus?: string; campusCode?: string },
     @Req() req: Request,
   ) {
     return this.auth.logout(
-      user || body.username || '',
+      bearerToken(authorization),
+      user || '',
       body.role || '',
       body.campus || '',
       body.campusCode || '',

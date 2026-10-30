@@ -1,5 +1,6 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ActivityLogService } from './activity-log.service';
+import { issueToken, revokeToken } from './auth-token';
 import { DatabaseService } from './database.service';
 
 type UserRow = {
@@ -142,7 +143,10 @@ export class AuthService {
       ipAddress,
     });
 
+    const token = await issueToken(this.database, loginName);
+
     return {
+      token,
       username: loginName,
       cata: row.cata?.trim() ?? null,
       desi,
@@ -156,12 +160,14 @@ export class AuthService {
   }
 
   async logout(
+    token: string,
     username: string,
     role = '',
     campus = '',
     campusCode = '',
     ipAddress = '',
   ) {
+    await revokeToken(this.database, token);
     const name = username.trim();
     if (!name) return { ok: false, message: 'Username required' };
     await this.activityLog.write({

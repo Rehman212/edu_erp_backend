@@ -66,19 +66,15 @@ export class SettingsService implements OnModuleInit {
   private async isAdmin(username: string) {
     const name = String(username || '').trim();
     if (!name) return false;
-    const user = await this.database.query<{ tname: string }>(
-      `SELECT trim(tname) AS tname FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
+    await this.database.query(`ALTER TABLE puser ADD COLUMN IF NOT EXISTS acct text`);
+    const user = await this.database.query<{ tname: string; acct: string | null }>(
+      `SELECT trim(tname) AS tname, trim(acct) AS acct
+       FROM puser WHERE upper(trim(tname)) = upper($1) LIMIT 1`,
       [name],
     );
-    const loginName = user.rows[0]?.tname;
-    if (!loginName) return false;
-    if (loginName === 'ESS_ADMN' || loginName === 'ESS') return true;
-    const rights = await this.database.query<{ n: string }>(
-      `SELECT count(*)::text AS n FROM cruser
-       WHERE upper(trim(crname)) = upper($1) AND upper(coalesce(mncode, '')) LIKE '%MODIFY%'`,
-      [loginName],
-    );
-    return Number(rights.rows[0]?.n) > 0;
+    const row = user.rows[0];
+    if (!row?.tname) return false;
+    return String(row.acct || '').toLowerCase() === 'admin';
   }
 
   private async requireAdmin(username: string) {

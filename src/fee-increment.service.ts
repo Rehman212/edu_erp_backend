@@ -538,6 +538,7 @@ export class FeeIncrementService {
     username: string,
     body: { invnos?: unknown; dueDate?: string; site?: string },
   ) {
+    await assertRoleAccess(this.database, username, 'feeIncrement', 'voucher');
     const dueRaw = String(body.dueDate || '')
       .trim()
       .slice(0, 10);

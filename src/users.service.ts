@@ -648,11 +648,26 @@ export class UsersService {
         : undefined;
     const profile = this.profileFromBody(body);
 
-    if (
-      status === 'Blocked' &&
-      actor.trim().toUpperCase() === row.tname.toUpperCase()
-    ) {
+    const self = actor.trim().toUpperCase() === row.tname.toUpperCase();
+    if (status === 'Blocked' && self) {
       return { ok: false, message: 'You cannot block your own account.' };
+    }
+    if (self && (accountType !== undefined || body.roleId !== undefined)) {
+      const mine = await this.database.query<{ acct: string; roleId: string }>(
+        `SELECT coalesce(trim(u.acct), '') AS acct, coalesce(ur.role_id, '') AS "roleId"
+         FROM puser u
+         LEFT JOIN erp_user_role ur ON upper(trim(ur.username)) = upper(trim(u.tname))
+         WHERE u.row_id::text = $1 LIMIT 1`,
+        [id],
+      );
+      const now = mine.rows[0];
+      const acctChanged =
+        accountType !== undefined && accountType.toLowerCase() !== String(now?.acct || '').toLowerCase();
+      const roleChanged =
+        body.roleId !== undefined && String(body.roleId).trim() !== String(now?.roleId || '');
+      if (acctChanged || roleChanged) {
+        return { ok: false, message: 'You cannot change your own account type or user role.' };
+      }
     }
 
     const sets: string[] = [];
@@ -694,6 +709,10 @@ export class UsersService {
         `UPDATE erp_user_role SET username = $1 WHERE upper(trim(username)) = upper($2)`,
         [nextName, row.tname],
       );
+      await this.database.query(
+        `UPDATE erp_session SET username = $1 WHERE upper(trim(username)) = upper($2)`,
+        [nextName, row.tname],
+      ).catch(() => undefined);
     }
     await this.saveUserRole(nextName, body.roleId);
 
