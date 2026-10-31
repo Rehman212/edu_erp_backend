@@ -1690,7 +1690,7 @@ export class PayrollService {
     await assertRoleAccess(
       this.database,
       username,
-      ['registration.employees', 'payrollReport'],
+      'payrollReport',
       'add',
     );
     if (!(await this.tableExists('persona'))) {
@@ -1787,7 +1787,7 @@ export class PayrollService {
     await assertRoleAccess(
       this.database,
       username,
-      ['registration.employees', 'payrollReport'],
+      'payrollReport',
       'edit',
     );
     if (!(await this.tableExists('persona'))) {
@@ -1853,7 +1853,7 @@ export class PayrollService {
     await assertRoleAccess(
       this.database,
       username,
-      ['registration.employees', 'payrollReport'],
+      'payrollReport',
       'delete',
     );
     // Soft-deactivate instead of hard delete (payroll Active/Inactive).
@@ -1869,7 +1869,7 @@ export class PayrollService {
       await assertRoleAccess(
         this.database,
         username,
-        ['registration.employees', 'payrollReport'],
+        'payrollReport',
         'edit',
       );
     }

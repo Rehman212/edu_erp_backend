@@ -69,6 +69,10 @@ export class UsersService {
            )`,
         );
         await this.database.query(
+          `UPDATE erp_role SET rights = rights - 'registration.employees'
+           WHERE rights ? 'registration.employees'`,
+        );
+        await this.database.query(
           `CREATE TABLE IF NOT EXISTS erp_user_role (
              username text PRIMARY KEY,
              role_id text NOT NULL

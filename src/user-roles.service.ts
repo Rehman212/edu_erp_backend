@@ -10,7 +10,6 @@ type Rights = Record<Flag, boolean>;
 const NODE_FLAGS: Record<string, readonly Flag[]> = {
   dashboard: ['view'],
   'registration.students': ['view', 'add', 'edit', 'delete', 'voucher'],
-  'registration.employees': ['view', 'add', 'edit', 'delete'],
   classChange: ['view', 'edit'],
   inventoryControl: ['view', 'add', 'edit', 'delete'],
   inventoryVoucher: ['view', 'add', 'edit', 'delete', 'voucher'],
@@ -62,6 +61,12 @@ export class UserRolesService {
              rights jsonb NOT NULL DEFAULT '{}'::jsonb,
              updated_at timestamptz NOT NULL DEFAULT now()
            )`,
+        )
+        .then(() =>
+          this.database.query(
+            `UPDATE erp_role SET rights = rights - 'registration.employees'
+             WHERE rights ? 'registration.employees'`,
+          ),
         )
         .then(() => undefined)
         .catch((err) => {
